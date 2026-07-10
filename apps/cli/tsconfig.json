@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "composite": true,
+    "rootDir": "src",
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/packs/literature" }
+  ],
+  "include": ["src/**/*.ts"]
+}

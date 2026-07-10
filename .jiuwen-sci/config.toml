@@ -1,0 +1,6 @@
+default_model = "mock:deterministic"
+
+[providers.openai_compatible]
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+api_key_env = "OPENAI_API_KEY"
+default_volcengine_model = "glm-5.2"

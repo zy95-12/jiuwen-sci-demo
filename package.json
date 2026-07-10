@@ -1,0 +1,26 @@
+{
+  "name": "jiuwen-sci",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/cli",
+    "packages/core",
+    "packages/packs/literature"
+  ],
+  "bin": {
+    "jiuwen-sci": "apps/cli/dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "node --test --experimental-sqlite tests/*.test.mjs",
+    "jiuwen-sci": "node --experimental-sqlite apps/cli/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  }
+}

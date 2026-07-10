@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+.jiuwen-sci/runtime.db
+.jiuwen-sci/runtime.db-*
+.jiuwen-sci/artifacts/
+.jiuwen-sci/logs/
+.jiuwen-sci/cache/

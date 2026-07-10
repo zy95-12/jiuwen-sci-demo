@@ -1,0 +1,13 @@
+{
+  "name": "@jiuwen-sci/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "jiuwen-sci": "./dist/index.js"
+  },
+  "dependencies": {
+    "@jiuwen-sci/core": "0.1.0",
+    "@jiuwen-sci/literature-pack": "0.1.0",
+    "commander": "^12.1.0"
+  }
+}
