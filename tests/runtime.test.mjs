@@ -190,6 +190,34 @@ test("literature pack registers and runs a stage contract", async () => {
   }
 });
 
+test("AI4S literature screening excludes modifier-only trend papers", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-ai4s-quality",
+      name: "Fake AI4S Quality",
+      description: "Fake connector for AI4S screening quality",
+      async search() {
+        return [
+          { id: "ai4s-1", title: "AI for Science and AI-driven scientific discovery trends", authors: ["A"], year: 2026, venue: "Test", url: "https://example.test/ai4s-1", sourceDb: "fake-ai4s-quality", abstract: "AI for Science uses foundation models and autonomous laboratories to accelerate scientific discovery." },
+          { id: "wind-1", title: "风力发电技术的现状与发展趋势简析", authors: ["B"], year: 2025, venue: "Test", url: "https://example.test/wind-1", sourceDb: "fake-ai4s-quality", abstract: "本文总结风力发电技术的发展现状和趋势。" }
+        ];
+      }
+    });
+    const result = await runtime.run({ input: "AI4S的发展现状和趋势", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-ai4s-quality"], limit: 2 } });
+    assert.equal(result.status, "completed");
+    const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
+    const screening = artifacts.map((artifact) => {
+      try { return JSON.parse(artifact.text); } catch { return null; }
+    }).find((parsed) => parsed?.stage === "screening_log");
+    assert.equal(screening.decisions.find((d) => d.paperId === "ai4s-1").decision, "include");
+    assert.equal(screening.decisions.find((d) => d.paperId === "wind-1").decision, "exclude");
+  } finally {
+    await cleanup();
+  }
+});
+
 test("stage contract retries a failed stage with verifier feedback", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {
@@ -285,6 +313,41 @@ test("stage gate policy can redirect to a pack-defined stage", async () => {
     const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "redirect-contract", userGoal: "redirect" });
     assert.equal(result.status, "completed");
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.redirected" && event.stageId === "work" && event.nextStageId === "plan"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage runner falls back when stage agent fails before scaffold", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    const contract = {
+      id: "fallback-contract",
+      name: "Fallback Contract",
+      description: "Fallback after agent failure",
+      initialStageId: "fallback",
+      stages: [{
+        id: "fallback",
+        goal: "Fallback after agent failure.",
+        agentId: "missing-stage-agent",
+        requiredArtifacts: [{ type: "json", stage: "fallback" }],
+        gate: {
+          deterministic: [{ id: "artifact_requirements_met", hardGate: true }],
+          rules: [{ when: "hard_gate_failed", action: "retry_stage" }, { when: "passed", action: "next" }]
+        },
+        run: async (ctx) => {
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "fallback", recovered: Boolean(ctx.state["stage.fallback.agentError"]) }) });
+          return { artifactIds: [artifact.id] };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "fallback-pack", name: "Fallback Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "fallback", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "fallback-contract", userGoal: "fallback" });
+    assert.equal(result.status, "completed");
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.agent_failed" && event.stageId === "fallback"));
+    const findings = await runtime.services.reviewStore.listBySession(session.id);
+    assert.ok(findings.some((finding) => finding.category === "stage_agent_failed"));
   } finally {
     await cleanup();
   }

@@ -243,6 +243,7 @@ export type StageSpec = {
   goal: string;
   agentId?: string;
   allowedTools?: string[];
+  requiredInputs?: string[];
   requiredArtifacts?: ArtifactRequirement[];
   verifiers?: string[];
   review?: StageReviewPolicy;
@@ -728,9 +729,10 @@ export function registerCoreStageVerifiers(registry: InMemoryStageVerifierRegist
 }
 
 const objectSchema = { type: "object" };
+const stringProp = { type: "string", minLength: 1 };
 
 export const artifactWriteTool: ToolDefinition<any, any> = {
-  id: "artifact_write", name: "Artifact Write", description: "Create an artifact.", inputSchema: objectSchema, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "artifact_write", name: "Artifact Write", description: "Create an artifact.", inputSchema: { type: "object", required: ["content"], properties: { type: stringProp, mediaType: stringProp, content: { type: "string" }, name: stringProp } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
     const artifact = await ctx.createArtifact({ type: input.type ?? "markdown", mediaType: input.mediaType ?? "text/markdown", content: String(input.content ?? "") });
     await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: input.name ?? "Artifact" }, { type: "tool_call", refId: ctx.toolCallId, label: ctx.toolCallId }], edges: [{ type: "created", fromRef: ctx.toolCallId, toRef: artifact.id }] });
@@ -739,7 +741,7 @@ export const artifactWriteTool: ToolDefinition<any, any> = {
 };
 
 export const artifactReadTool: ToolDefinition<any, any> = {
-  id: "artifact_read", name: "Artifact Read", description: "Read artifact text.", inputSchema: objectSchema, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "artifact_read", name: "Artifact Read", description: "Read artifact text.", inputSchema: { type: "object", required: ["artifactId"], properties: { artifactId: stringProp } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
     const bytes = await ctx.runtime.artifactStore.read(String(input.artifactId));
     return { artifactId: input.artifactId, content: bytes.toString("utf8") };
@@ -747,7 +749,7 @@ export const artifactReadTool: ToolDefinition<any, any> = {
 };
 
 export const reviewFindingWriteTool: ToolDefinition<any, any> = {
-  id: "review_finding_write", name: "Review Finding Write", description: "Record a review finding.", inputSchema: objectSchema, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "review_finding_write", name: "Review Finding Write", description: "Record a review finding.", inputSchema: { type: "object", required: ["description"], properties: { severity: stringProp, category: stringProp, targetType: stringProp, targetRef: stringProp, description: stringProp, suggestedAction: stringProp } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
     const finding = await ctx.runtime.reviewStore.create({ sessionId: ctx.sessionId, severity: input.severity ?? "minor", category: input.category ?? "general", targetType: input.targetType ?? "session", targetRef: input.targetRef ?? ctx.sessionId, description: String(input.description ?? "Review finding"), suggestedAction: input.suggestedAction });
     await ctx.recordProvenance({ nodes: [{ type: "review", refId: finding.id, label: finding.description }], edges: [] });
@@ -756,7 +758,7 @@ export const reviewFindingWriteTool: ToolDefinition<any, any> = {
 };
 
 export const finalizeTool: ToolDefinition<any, any> = {
-  id: "finalize", name: "Finalize", description: "Finalize the current session output.", inputSchema: objectSchema, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "finalize", name: "Finalize", description: "Finalize the current session output.", inputSchema: { type: "object", properties: { finalText: { type: "string" }, output: { type: "string" }, answer: { type: "string" }, content: { type: "string" }, text: { type: "string" }, acceptRisk: { type: "boolean" } } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
     const blocking = await ctx.runtime.reviewStore.listOpenBlocking(ctx.sessionId);
     if (blocking.length && !input.acceptRisk) return { status: "blocked", output: "", blockingFindingIds: blocking.map((f) => f.id) };
@@ -769,7 +771,7 @@ export const finalizeTool: ToolDefinition<any, any> = {
 };
 
 export const taskTool: ToolDefinition<TaskInput, TaskOutput> = {
-  id: "task", name: "Task", description: "Delegate bounded work to a subagent running in a child session.", inputSchema: objectSchema, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "task", name: "Task", description: "Delegate bounded work to a subagent running in a child session.", inputSchema: { type: "object", required: ["agentId", "description", "input"], properties: { agentId: stringProp, description: stringProp, input: stringProp, contextArtifactIds: { type: "array", items: stringProp } } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
     const target = ctx.runtime.agentRegistry.get(input.agentId);
     if (!target) throw new RuntimeError("AGENT_NOT_FOUND", input.agentId);
@@ -778,10 +780,16 @@ export const taskTool: ToolDefinition<TaskInput, TaskOutput> = {
     if (!parent) throw new RuntimeError("SESSION_NOT_FOUND", ctx.sessionId);
     const child = await ctx.runtime.sessionStore.create({ parentId: parent.id, agentId: input.agentId, input: input.input, cwd: parent.cwd, model: input.model ?? target.model ?? parent.model, title: `${input.description} (@${input.agentId})`, permissions: target.permissions, metadata: { delegatedBy: ctx.agentId, contextArtifactIds: input.contextArtifactIds ?? [] } });
     await ctx.emit({ type: "task.started", parentSessionId: parent.id, childSessionId: child.id, agentId: input.agentId });
-    const result = await new AgentSessionRunner(ctx.runtime).runSession({ sessionId: child.id, mode: "subagent", contextArtifactIds: input.contextArtifactIds ?? [] });
-    await ctx.emit({ type: "task.completed", parentSessionId: parent.id, childSessionId: child.id });
-    await ctx.recordProvenance({ nodes: [{ type: "session", refId: parent.id, label: `Parent ${parent.id}` }, { type: "session", refId: child.id, label: `Child ${child.id}` }], edges: [{ type: "spawned", fromRef: parent.id, toRef: child.id }] });
-    return { childSessionId: child.id, status: result.status, summary: result.output, artifactIds: result.artifactIds };
+    try {
+      const result = await new AgentSessionRunner(ctx.runtime).runSession({ sessionId: child.id, mode: "subagent", contextArtifactIds: input.contextArtifactIds ?? [] });
+      await ctx.emit({ type: "task.completed", parentSessionId: parent.id, childSessionId: child.id });
+      await ctx.recordProvenance({ nodes: [{ type: "session", refId: parent.id, label: `Parent ${parent.id}` }, { type: "session", refId: child.id, label: `Child ${child.id}` }], edges: [{ type: "spawned", fromRef: parent.id, toRef: child.id }] });
+      return { childSessionId: child.id, status: result.status, summary: result.output, artifactIds: result.artifactIds };
+    } catch (error) {
+      await ctx.runtime.sessionStore.update(child.id, { status: "failed" });
+      await ctx.emit({ type: "task.failed", parentSessionId: parent.id, childSessionId: child.id, agentId: input.agentId, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
   }
 };
 
@@ -791,6 +799,7 @@ export class ToolRuntime {
     if (input.allowedToolIds && !input.allowedToolIds.includes(input.toolId)) throw new RuntimeError("TOOL_NOT_ALLOWED_IN_STAGE", input.toolId);
     const tool = this.services.toolRegistry.get(input.toolId);
     if (!tool) throw new RuntimeError("TOOL_NOT_FOUND", input.toolId);
+    validateToolInput(tool, input.input);
     const perm = await this.services.permissionService.check();
     if (!perm.allowed) throw new RuntimeError("TOOL_PERMISSION_DENIED", perm.reason ?? input.toolId);
     const call = await this.services.toolCallStore.create({ sessionId: input.sessionId, toolId: input.toolId, inputJson: input.input, status: "running" });
@@ -1044,14 +1053,24 @@ export class StageContractRunner {
     let artifactIds = input.artifactIds;
     let agentTask: TaskOutput | undefined;
     if (stage.agentId) {
-      agentTask = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
-        agentId: stage.agentId,
-        description: `Stage ${stage.id}`,
-        input: renderStageAgentPrompt({ contract, stage, userGoal, attempt: input.attempt, feedback: input.feedback }),
-        contextArtifactIds: artifactIds
-      });
-      artifactIds = [...new Set([...artifactIds, ...agentTask.artifactIds])];
-      state[`stage.${stage.id}.agentTask`] = agentTask;
+      const manifest = await createArtifactManifest(this.services, artifactIds);
+      if (!this.services.agentRegistry.get(stage.agentId)) {
+        await this.recordStageAgentFailure({ sessionId, contract, stage, state, feedback: input.feedback, message: `AGENT_NOT_FOUND: ${stage.agentId}` });
+      } else {
+      try {
+        agentTask = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
+          agentId: stage.agentId,
+          description: `Stage ${stage.id}`,
+          input: renderStageAgentPrompt({ contract, stage, userGoal, attempt: input.attempt, feedback: input.feedback, artifactManifest: manifest }),
+          contextArtifactIds: artifactIds
+        });
+        artifactIds = [...new Set([...artifactIds, ...agentTask.artifactIds])];
+        state[`stage.${stage.id}.agentTask`] = agentTask;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.recordStageAgentFailure({ sessionId, contract, stage, state, feedback: input.feedback, message });
+      }
+      }
     }
     if (!stage.run) return { artifactIds: agentTask?.artifactIds ?? [], statePatch: agentTask ? { [`stage.${stage.id}.agentTask`]: agentTask } : undefined };
     const toolRuntime = new ToolRuntime(this.services);
@@ -1077,6 +1096,21 @@ export class StageContractRunner {
       artifactIds: [...new Set([...(agentTask?.artifactIds ?? []), ...(result.artifactIds ?? [])])],
       statePatch: { ...(agentTask ? { [`stage.${stage.id}.agentTask`]: agentTask } : {}), ...(result.statePatch ?? {}) }
     };
+  }
+
+  private async recordStageAgentFailure(input: { sessionId: string; contract: StageContractDefinition; stage: StageSpec; state: Record<string, unknown>; feedback: string[]; message: string }): Promise<void> {
+    input.state[`stage.${input.stage.id}.agentError`] = input.message;
+    input.state[`stage.${input.stage.id}.feedback`] = [...input.feedback, `Stage agent failed before producing valid artifacts: ${input.message}`];
+    await this.services.reviewStore.create({
+      sessionId: input.sessionId,
+      severity: "major",
+      category: "stage_agent_failed",
+      targetType: "stage",
+      targetRef: input.stage.id,
+      description: `Stage agent failed before scaffold fallback: ${input.message}`,
+      suggestedAction: "Use scaffold fallback for this attempt and tighten the stage agent tool arguments."
+    });
+    await this.services.eventBus.emit({ type: "stage.agent_failed", sessionId: input.sessionId, contractId: input.contract.id, stageId: input.stage.id, error: input.message });
   }
 
   private async evaluateGate(contract: StageContractDefinition, stage: StageSpec, sessionId: string, artifactIds: string[], state: Record<string, unknown>, attempt: number): Promise<{ action: StageGateDecisionRule["action"]; nextStageId?: string; messages: string[]; findingIds: string[]; reportArtifactId: string }> {
@@ -1119,9 +1153,12 @@ export class StageContractRunner {
 
     const report = await this.writeVerifierReport({ sessionId, contract, stage, attempt, deterministicResults, messages, state });
     const artifactIdsWithReport = [...new Set([...artifactIds, report.id])];
+    const artifactManifest = await createArtifactManifest(this.services, artifactIdsWithReport);
     const deterministicOk = deterministicResults.every((result) => result.ok);
     const hardGateFailed = deterministicResults.some((result) => !result.ok && result.hardGate);
     const reviewPolicy = gate.semantic;
+    const existingStageFindings = (await this.services.reviewStore.listBySession(sessionId)).filter((finding) => finding.targetType === "stage" && finding.targetRef === stage.id && finding.status === "open" && ["stage_agent_failed", "stage_review_failed"].includes(finding.category));
+    semanticFindings.push(...existingStageFindings);
 
     if (reviewPolicy?.mode === "always" || (reviewPolicy?.mode === "on_failure" && !deterministicOk)) {
       if (reviewPolicy.reviewerId) {
@@ -1131,15 +1168,32 @@ export class StageContractRunner {
         findingIds.push(...review.findingIds);
         semanticFindings.push(...(await this.services.reviewStore.listBySession(sessionId)).filter((finding) => review.findingIds.includes(finding.id)));
       } else if (reviewPolicy.agentId) {
-        const review = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
-          agentId: reviewPolicy.agentId,
-          description: `Review stage ${stage.id}`,
-          input: `Review stage "${stage.id}" for semantic quality and blocking issues. Use the verifier_report artifact to avoid repeating deterministic checks and focus on semantic risks.`,
-          contextArtifactIds: artifactIdsWithReport
-        });
-        const childFindings = await this.services.reviewStore.listBySession(review.childSessionId);
-        semanticFindings.push(...childFindings);
-        findingIds.push(...childFindings.map((f) => f.id));
+        try {
+          const review = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
+            agentId: reviewPolicy.agentId,
+            description: `Review stage ${stage.id}`,
+            input: `Review stage "${stage.id}" for semantic quality and blocking issues. Use the verifier_report artifact to avoid repeating deterministic checks and focus on semantic risks.\n\nArtifact manifest:\n${JSON.stringify(artifactManifest, null, 2)}\n\nDo not call artifact_read unless artifactId is copied exactly from this manifest.`,
+            contextArtifactIds: artifactIdsWithReport
+          });
+          const childFindings = await this.services.reviewStore.listBySession(review.childSessionId);
+          semanticFindings.push(...childFindings);
+          findingIds.push(...childFindings.map((f) => f.id));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const finding = await this.services.reviewStore.create({
+            sessionId,
+            severity: "major",
+            category: "stage_review_failed",
+            targetType: "stage",
+            targetRef: stage.id,
+            description: `Stage review agent failed; continuing with deterministic gate only: ${message}`,
+            suggestedAction: "Tighten reviewer prompt/tool arguments and rerun semantic review."
+          });
+          findingIds.push(finding.id);
+          semanticFindings.push(finding);
+          messages.push(finding.description);
+          await this.services.eventBus.emit({ type: "stage.review_failed", sessionId, contractId: contract.id, stageId: stage.id, error: message });
+        }
       }
     }
 
@@ -1218,6 +1272,7 @@ function gateSignals(input: { deterministicOk: boolean; hardGateFailed: boolean;
   for (const finding of input.semanticFindings.filter((finding) => finding.status === "open")) {
     signals.push(`review_${finding.severity}`);
     signals.push(`review_${finding.severity}:${finding.category}`);
+    signals.push(finding.category);
   }
   return signals;
 }
@@ -1226,7 +1281,7 @@ function gateRuleMatches(ruleWhen: string, signal: string): boolean {
   return ruleWhen === signal || (ruleWhen.endsWith(":*") && signal.startsWith(ruleWhen.slice(0, -1)));
 }
 
-function renderStageAgentPrompt(input: { contract: StageContractDefinition; stage: StageSpec; userGoal: string; attempt: number; feedback: string[] }): string {
+function renderStageAgentPrompt(input: { contract: StageContractDefinition; stage: StageSpec; userGoal: string; attempt: number; feedback: string[]; artifactManifest: unknown }): string {
   const required = input.stage.requiredArtifacts?.length
     ? input.stage.requiredArtifacts.map((req) => `- ${JSON.stringify(req)}`).join("\n")
     : "- No required artifacts declared.";
@@ -1240,11 +1295,80 @@ function renderStageAgentPrompt(input: { contract: StageContractDefinition; stag
     `User goal:\n${input.userGoal}`,
     `Attempt: ${input.attempt}`,
     `Allowed tools: ${allowedTools}`,
+    `Required input roles: ${(input.stage.requiredInputs ?? []).join(", ") || "none declared"}`,
     `Required artifacts:\n${required}`,
     `Verifiers that will judge completion:\n${verifiers}`,
+    `Artifact manifest:\n${JSON.stringify(input.artifactManifest, null, 2)}`,
     feedback,
-    "Produce the required structured artifacts with artifact_write before finalizing. For JSON artifacts, include the declared stage field exactly. Do not skip a required artifact by only describing it in final text."
+    "Produce the required structured artifacts with artifact_write before finalizing. For JSON artifacts, include the declared stage field exactly. If reading an artifact, copy artifactId exactly from the manifest; never call artifact_read with an empty or invented artifactId."
   ].filter(Boolean).join("\n\n");
+}
+
+function validateToolInput(tool: ToolDefinition, input: unknown): void {
+  const schema = tool.inputSchema ?? {};
+  if ((schema as any).type !== "object") return;
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}: input must be an object`);
+  const obj = input as Record<string, unknown>;
+  for (const key of ((schema as any).required ?? [])) {
+    const value = obj[key];
+    if (value === undefined || value === null || value === "") throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} is required`);
+  }
+  const props = ((schema as any).properties ?? {}) as Record<string, any>;
+  for (const [key, prop] of Object.entries(props)) {
+    if (!(key in obj) || obj[key] === undefined || obj[key] === null) continue;
+    const value = obj[key];
+    if (prop.type === "string" && typeof value !== "string") throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must be a string`);
+    if (prop.type === "number" && typeof value !== "number") throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must be a number`);
+    if (prop.type === "integer" && (!Number.isInteger(value))) throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must be an integer`);
+    if (prop.type === "boolean" && typeof value !== "boolean") throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must be a boolean`);
+    if (prop.type === "array" && !Array.isArray(value)) throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must be an array`);
+    if (prop.minLength && typeof value === "string" && value.trim().length < Number(prop.minLength)) throw new RuntimeError("TOOL_INPUT_INVALID", `${tool.id}.${key} must not be empty`);
+  }
+}
+
+async function createArtifactManifest(services: RuntimeServices, artifactIds: string[]): Promise<{ artifacts: { id: string; type: string; mediaType: string; stage?: string; role?: string; size: number; createdAt: string }[]; byStage: Record<string, string[]>; byRole: Record<string, string[]> }> {
+  const artifacts = [];
+  const byStage: Record<string, string[]> = {};
+  const byRole: Record<string, string[]> = {};
+  for (const id of [...new Set(artifactIds)]) {
+    const artifact = await services.artifactStore.get(id);
+    if (!artifact) continue;
+    let stage: string | undefined;
+    if (artifact.mediaType === "application/json") {
+      try {
+        const parsed = JSON.parse((await services.artifactStore.read(id)).toString("utf8"));
+        if (typeof parsed?.stage === "string") stage = parsed.stage;
+      } catch {
+        // Ignore non-JSON content with a JSON media type.
+      }
+    }
+    const role = stageToArtifactRole(stage) ?? artifact.type;
+    artifacts.push({ id: artifact.id, type: artifact.type, mediaType: artifact.mediaType, stage, role, size: artifact.size, createdAt: artifact.createdAt });
+    if (stage) byStage[stage] = [...(byStage[stage] ?? []), artifact.id];
+    if (role) byRole[role] = [...(byRole[role] ?? []), artifact.id];
+  }
+  return { artifacts, byStage, byRole };
+}
+
+function stageToArtifactRole(stage?: string): string | undefined {
+  const roles: Record<string, string> = {
+    protocol: "protocol",
+    queries: "query_plan",
+    identification: "identification",
+    citation_chaining: "citation_chaining",
+    deduplication: "deduped_papers",
+    screening_log: "screening_log",
+    eligibility_log: "eligibility_log",
+    quality_assessment: "quality_assessment",
+    included_studies: "included_studies",
+    evidence_table: "evidence_table",
+    contradiction_detection: "contradiction_detection",
+    citation_verification: "citation_verification",
+    prisma_flow: "prisma_flow",
+    verifier_report: "verifier_report",
+    review_findings: "review_findings"
+  };
+  return stage ? roles[stage] : undefined;
 }
 
 async function countMatchingArtifacts(services: RuntimeServices, artifactIds: string[], req: ArtifactRequirement): Promise<number> {

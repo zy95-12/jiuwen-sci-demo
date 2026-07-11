@@ -316,12 +316,14 @@ function normalizeDoi(value?: string): string | undefined {
 }
 
 const objectSchema = { type: "object" };
+const requiredString = { type: "string", minLength: 1 };
+const paperArray = { type: "array", items: { type: "object" } };
 
 export const scienceListDbsTool: ToolDefinition<any, any> = {
   id: "science_list_dbs",
   name: "Science List DBs",
   description: "List available literature databases.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", properties: {} },
   outputSchema: objectSchema,
   permission: { kind: "network", default: "allow" },
   async execute(ctx) {
@@ -334,7 +336,7 @@ export const scienceSearchTool: ToolDefinition<any, any> = {
   id: "science_search",
   name: "Science Search",
   description: "Search a literature database by db id.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["db", "query"], properties: { db: requiredString, query: requiredString, limit: { type: "integer", minimum: 1 } } },
   outputSchema: objectSchema,
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
@@ -358,7 +360,7 @@ export const paperFetchTool: ToolDefinition<any, any> = {
   id: "paper_fetch",
   name: "Paper Fetch",
   description: "Fetch a single paper record from a literature connector when supported.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["db", "id"], properties: { db: requiredString, id: requiredString } },
   outputSchema: objectSchema,
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
@@ -374,7 +376,7 @@ export const paperDeduplicateTool: ToolDefinition<any, any> = {
   id: "paper_deduplicate",
   name: "Paper Deduplicate",
   description: "Deduplicate papers by DOI and normalized title.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["papers"], properties: { papers: paperArray } },
   outputSchema: objectSchema,
   permission: { kind: "runtime" },
   async execute(ctx, input) {
@@ -395,7 +397,7 @@ export const citationChainTool: ToolDefinition<any, any> = {
   id: "citation_chain",
   name: "Citation Chain",
   description: "Collect forward/backward citation hints for seed papers where metadata supports it.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["papers"], properties: { papers: paperArray, limit: { type: "integer", minimum: 1 } } },
   outputSchema: objectSchema,
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
@@ -416,7 +418,7 @@ export const citationVerifyTool: ToolDefinition<any, any> = {
   id: "citation_verify",
   name: "Citation Verify",
   description: "Verify basic citation metadata and flag missing identifiers.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["papers"], properties: { papers: paperArray } },
   outputSchema: objectSchema,
   permission: { kind: "runtime" },
   async execute(ctx, input) {
@@ -439,7 +441,7 @@ export const bibtexWriteTool: ToolDefinition<any, any> = {
   id: "bibtex_write",
   name: "BibTeX Write",
   description: "Create BibTeX entries for included papers.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["papers"], properties: { papers: paperArray } },
   outputSchema: objectSchema,
   permission: { kind: "runtime" },
   async execute(ctx, input) {
@@ -479,7 +481,7 @@ export const citationCheckTool: ToolDefinition<any, any> = {
   id: "citation_check",
   name: "Citation Check",
   description: "Check whether cited paper ids exist in the supplied paper set.",
-  inputSchema: objectSchema,
+  inputSchema: { type: "object", required: ["papers", "citations"], properties: { papers: paperArray, citations: { type: "array", items: requiredString } } },
   outputSchema: objectSchema,
   permission: { kind: "runtime" },
   async execute(_ctx, input) {
@@ -533,10 +535,10 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-query-agent",
       allowedTools: ["artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "protocol" }, { type: "json", stage: "queries" }],
-      verifiers: ["artifact_requirements_met", "literature_protocol_valid"],
+      verifiers: ["artifact_requirements_met", "literature_protocol_valid", "literature_query_concepts_valid"],
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
-        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_protocol_valid", hardGate: true }],
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_protocol_valid", hardGate: true }, { id: "literature_query_concepts_valid", hardGate: true }],
         rules: [
           { when: "hard_gate_failed", action: "retry_stage" },
           { when: "verifier_failed", action: "retry_stage" },
@@ -549,14 +551,16 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const agentQueries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
         if (agentProtocol && agentQueries) {
           const dbs = Array.isArray(agentProtocol.databases) && agentProtocol.databases.length ? agentProtocol.databases.map(String) : selectedQueryDbs(agentQueries);
-          return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria() } };
+          const topicProfile = topicProfileFromQueries(agentQueries);
+          return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile } };
         }
         const limit = Number(ctx.metadata.limit ?? 25);
         const dbs = Array.isArray(ctx.metadata.dbs) && ctx.metadata.dbs.length ? ctx.metadata.dbs.map(String) : ["openalex", "semantic-scholar", "crossref"];
         const criteria = defaultCriteria();
-        const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
-        const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "queries", researchQuestion: ctx.input, concepts: inferConcepts(ctx.input), criteria, selectedQueries: dbs.map((db) => ({ database: db, query: ctx.input, rationale: "Primary selected query for this stage contract." })), alternativeQueries: dbs.map((db) => ({ database: db, query: `${ctx.input} systematic review`, rationale: "Fallback recall-expansion query." })) }, null, 2) });
-        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
+        const queryPlan = buildQueryPlan(ctx.input, dbs, criteria);
+        const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
+        const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(queryPlan, null, 2) });
+        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan), protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
       }
     },
     {
@@ -591,7 +595,9 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const searchCounts: Record<string, number> = {};
         const sourceErrors: any[] = [];
         for (const db of dbs) {
-          const result = await ctx.tool({ toolId: "science_search", input: { db, query: ctx.input, limit } });
+          const queryPlan = ctx.state.queryPlan as any;
+          const query = queryPlan?.selectedQueries?.find((q: any) => q.database === db)?.query ?? ctx.input;
+          const result = await ctx.tool({ toolId: "science_search", input: { db, query, limit } });
           const out = result.output as any;
           allPapers.push(...(out.results ?? []));
           searchCounts[db] = out.count ?? 0;
@@ -614,10 +620,10 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-screening-agent",
       allowedTools: ["artifact_read", "artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "screening_log" }],
-      verifiers: ["artifact_requirements_met", "literature_screening_complete"],
+      verifiers: ["artifact_requirements_met", "literature_screening_complete", "literature_screening_topic_anchor_valid"],
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
-        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_screening_complete", hardGate: true }],
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_screening_complete", hardGate: true }, { id: "literature_screening_topic_anchor_valid", hardGate: true }],
         semantic: { agentId: "literature-reviewer-agent", mode: "always" },
         rules: [
           { when: "hard_gate_failed", action: "retry_stage" },
@@ -637,7 +643,8 @@ export const literatureReviewStageContract: StageContractDefinition = {
           return { statePatch: { screeningDecisions, screenedIn } };
         }
         const criteria = ctx.state.criteria ?? defaultCriteria();
-        const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper));
+        const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan);
+        const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper, topicProfile));
         const screenedIn = screeningDecisions.filter((d) => d.decision === "include").map((d) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
         const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, decisions: screeningDecisions }, null, 2) });
         return { artifactIds: [screeningLog.id], statePatch: { screeningDecisions, screenedIn, screeningLogArtifactId: screeningLog.id } };
@@ -813,6 +820,21 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
     }
   },
   {
+    id: "literature_query_concepts_valid",
+    description: "Validate concept grounding and expanded scholarly queries.",
+    async verify(ctx) {
+      const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
+      const coreTerms = termsOf(queries?.coreTerms);
+      const selectedQueries = Array.isArray(queries?.selectedQueries) ? queries.selectedQueries : [];
+      const hasDefinition = Boolean(queries?.conceptDefinition?.definition);
+      const hasCore = coreTerms.length >= 3;
+      const hasExpandedEnglish = selectedQueries.some((q: any) => /AI for Science|Artificial Intelligence for Science|scientific discovery|foundation models for science/i.test(String(q.query ?? "")));
+      const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(queries?.researchQuestion ?? "")));
+      const ok = hasDefinition && hasCore && hasExpandedEnglish && notOnlyRawQuestion;
+      return ok ? { ok: true, message: "Query concept grounding and expansion are valid." } : { ok: false, message: "Query plan lacks concept grounding, AI4S core terms, or expanded English scholarly queries.", severity: "blocking", category: "query_concepts_invalid" };
+    }
+  },
+  {
     id: "literature_search_valid",
     description: "Validate search and deduplication outputs.",
     async verify(ctx) {
@@ -834,6 +856,26 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       const decisions = screening?.decisions ?? [];
       const complete = Array.isArray(papers) && Array.isArray(decisions) && decisions.length === papers.length && decisions.every((d: any) => d.paperId && ["include", "exclude", "uncertain"].includes(d.decision) && d.reason);
       return complete ? { ok: true, message: "Screening decisions are complete." } : { ok: false, message: "Screening log does not contain a valid decision and reason for every deduplicated record.", severity: "major", category: "screening_incomplete" };
+    }
+  },
+  {
+    id: "literature_screening_topic_anchor_valid",
+    description: "Validate that included studies match AI4S core topic anchors, not only trend modifiers.",
+    async verify(ctx) {
+      const dedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
+      const screening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
+      const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
+      const topicProfile = topicProfileFromQueries(queries);
+      const papers: PaperHit[] = dedupe?.deduped ?? [];
+      const decisions = screening?.decisions ?? [];
+      const included = decisions.filter((d: any) => d.decision === "include");
+      const weak = included.filter((d: any) => {
+        const paper = papers.find((p) => p.id === d.paperId);
+        return !paper || !topicAnchorScore(paper, topicProfile).anchored;
+      });
+      return weak.length === 0
+        ? { ok: true, message: "Included studies have topic anchors." }
+        : { ok: false, message: `Included studies without AI4S topic anchors: ${weak.map((d: any) => d.title ?? d.paperId).join("; ")}`, severity: "blocking", category: "topic_anchor_failed" };
     }
   },
   {
@@ -882,6 +924,99 @@ async function readStageArtifact(services: RuntimeServices, artifactIds: string[
   return null;
 }
 
+type TopicProfile = {
+  coreTerms: string[];
+  domainTerms: string[];
+  modifierTerms: string[];
+};
+
+function buildQueryPlan(question: string, dbs: string[], criteria: unknown): any {
+  const ai4s = defaultAi4sTopicProfile();
+  const broadQuery = '("AI for Science" OR "Artificial Intelligence for Science" OR "AI4S" OR "AI-driven scientific discovery" OR "scientific machine learning")';
+  const trendQuery = `${broadQuery} AND (review OR survey OR roadmap OR trend OR "current status" OR "future directions")`;
+  const domainQuery = '("foundation models for science" OR "autonomous laboratory" OR "materials discovery" OR "drug discovery" OR "protein design" OR "climate modeling" OR "physics-informed neural networks")';
+  return {
+    stage: "queries",
+    researchQuestion: question,
+    conceptDefinition: {
+      term: "AI4S",
+      definition: "AI4S refers to using artificial intelligence methods to accelerate scientific discovery, modeling, experimentation, and engineering across scientific domains.",
+      scope: ["AI-driven scientific discovery", "scientific machine learning", "foundation models for science", "autonomous laboratories", "domain discovery tasks such as materials, drug, protein, climate, and physics modeling"]
+    },
+    concepts: inferConcepts(question),
+    coreTerms: ai4s.coreTerms,
+    domainTerms: ai4s.domainTerms,
+    modifierTerms: ai4s.modifierTerms,
+    criteria,
+    selectedQueries: dbs.map((db) => ({ database: db, query: `${trendQuery} OR ${domainQuery}`, rationale: "Expanded AI4S query with core concept anchors, domain applications, and trend/review modifiers." })),
+    alternativeQueries: dbs.flatMap((db) => [
+      { database: db, query: broadQuery, rationale: "High-precision AI4S core concept query." },
+      { database: db, query: domainQuery, rationale: "Domain-expansion query for AI4S application areas." }
+    ])
+  };
+}
+
+function defaultAi4sTopicProfile(): TopicProfile {
+  return {
+    coreTerms: [
+      "ai4s",
+      "ai for science",
+      "artificial intelligence for science",
+      "ai-driven scientific discovery",
+      "scientific discovery",
+      "scientific machine learning",
+      "foundation models for science",
+      "machine learning for science"
+    ],
+    domainTerms: [
+      "materials discovery",
+      "drug discovery",
+      "protein design",
+      "climate modeling",
+      "autonomous laboratory",
+      "autonomous laboratories",
+      "robot scientist",
+      "self-driving laboratory",
+      "physics-informed neural networks",
+      "simulation surrogate",
+      "biopharmaceutical r&d",
+      "molecular generation",
+      "crystal structure prediction"
+    ],
+    modifierTerms: [
+      "development status",
+      "current status",
+      "trend",
+      "trends",
+      "future direction",
+      "future directions",
+      "roadmap",
+      "review",
+      "survey",
+      "现状",
+      "趋势",
+      "发展"
+    ]
+  };
+}
+
+function topicProfileFromQueries(queries: any): TopicProfile {
+  const fallback = defaultAi4sTopicProfile();
+  return {
+    coreTerms: termsOf(queries?.coreTerms).length ? termsOf(queries?.coreTerms) : fallback.coreTerms,
+    domainTerms: termsOf(queries?.domainTerms).length ? termsOf(queries?.domainTerms) : fallback.domainTerms,
+    modifierTerms: termsOf(queries?.modifierTerms).length ? termsOf(queries?.modifierTerms) : fallback.modifierTerms
+  };
+}
+
+function termsOf(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String).map((s) => s.trim()).filter(Boolean) : [];
+}
+
+function normalizeText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 function selectedQueryDbs(queries: any): string[] {
   const selected = Array.isArray(queries?.selectedQueries) ? queries.selectedQueries : [];
   return selected.map((q: any) => q.database).filter((db: unknown): db is string => typeof db === "string" && db.length > 0);
@@ -897,26 +1032,39 @@ async function listArtifactsByType(services: RuntimeServices, artifactIds: strin
 }
 
 function inferConcepts(question: string): any[] {
+  if (/ai4s|AI4S/i.test(question)) {
+    return [
+      { name: "AI4S", synonyms: ["AI for Science", "Artificial Intelligence for Science", "AI-driven scientific discovery"], required: true },
+      { name: "Scientific machine learning", synonyms: ["machine learning for science", "physics-informed neural networks"], required: false },
+      { name: "Autonomous scientific discovery", synonyms: ["autonomous laboratory", "self-driving laboratory", "robot scientist"], required: false },
+      { name: "Domain discovery", synonyms: ["materials discovery", "drug discovery", "protein design", "climate modeling"], required: false }
+    ];
+  }
   return question.split(/\s+/).filter((w) => w.length > 3).slice(0, 10).map((name) => ({ name, synonyms: [], required: false }));
 }
 
-function scorePaper(question: string, paper: PaperHit): number {
-  const haystack = `${paper.title} ${paper.abstract ?? ""}`.toLowerCase();
-  const terms = question.toLowerCase().split(/\s+/).filter((t) => t.length > 3);
-  const hits = terms.filter((term) => haystack.includes(term)).length;
-  return hits / Math.max(terms.length, 1) + (paper.abstract ? 0.2 : 0) + (paper.doi || paper.url ? 0.1 : 0);
+function topicAnchorScore(paper: PaperHit, profile: TopicProfile): { anchored: boolean; score: number; coreHits: string[]; domainHits: string[]; modifierHits: string[] } {
+  const haystack = normalizeText(`${paper.title} ${paper.abstract ?? ""} ${paper.venue ?? ""}`);
+  const coreHits = profile.coreTerms.filter((term) => haystack.includes(normalizeText(term)));
+  const domainHits = profile.domainTerms.filter((term) => haystack.includes(normalizeText(term)));
+  const modifierHits = profile.modifierTerms.filter((term) => haystack.includes(normalizeText(term)));
+  const anchored = coreHits.length > 0 || (domainHits.length > 0 && /\b(ai|artificial intelligence|machine learning|deep learning|foundation model|neural network)\b/i.test(haystack));
+  const score = coreHits.length * 3 + domainHits.length * 1.5 + modifierHits.length * 0.2 + (paper.abstract ? 0.3 : 0) + (paper.doi || paper.url ? 0.1 : 0);
+  return { anchored, score, coreHits, domainHits, modifierHits };
 }
 
-function screenPaper(question: string, paper: PaperHit): any {
-  const score = scorePaper(question, paper);
-  const decision = score >= 0.25 ? "include" : "exclude";
+function screenPaper(_question: string, paper: PaperHit, profile: TopicProfile): any {
+  const anchor = topicAnchorScore(paper, profile);
+  const decision = anchor.anchored && anchor.score >= 1.5 ? "include" : "exclude";
   return {
     paperId: paper.id,
     title: paper.title,
     decision,
     criteria: decision === "include" ? ["IC1", paper.abstract ? "IC2" : "IC3"] : ["EC1"],
-    reason: decision === "include" ? "Included: metadata/abstract overlaps with the research question." : "Excluded: title/abstract relevance is below threshold.",
-    confidence: Math.min(0.95, Math.max(0.35, score))
+    reason: decision === "include"
+      ? `Included: matched AI4S topic anchors. Core hits: ${anchor.coreHits.join(", ") || "none"}; domain hits: ${anchor.domainHits.join(", ") || "none"}.`
+      : `Excluded: no sufficient AI4S topic anchor. Modifier-only hits: ${anchor.modifierHits.join(", ") || "none"}.`,
+    confidence: Math.min(0.95, Math.max(0.35, anchor.score / 4))
   };
 }
 
