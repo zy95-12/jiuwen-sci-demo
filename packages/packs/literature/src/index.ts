@@ -29,10 +29,40 @@ export type PaperHit = {
 
 export type LiteratureSearchInput = { query: string; limit?: number };
 
+export type SourceErrorType = "rate_limited" | "timeout" | "server_error" | "not_found" | "bad_request" | "network" | "unsupported" | "unknown";
+
+export type SourceError = {
+  ok: false;
+  db: string;
+  operation: "search" | "fetch" | "citation_chain";
+  errorType: SourceErrorType;
+  retryable: boolean;
+  message: string;
+  guidance: string;
+  status?: number;
+};
+
+export type ConnectorCapability = {
+  search: boolean;
+  fetch: boolean;
+  citationGraph: "none" | "search_result" | "fetch";
+  abstracts: boolean;
+  doi: boolean;
+  fullTextLinks: boolean;
+};
+
+export type ConnectorMetadata = {
+  capabilities: ConnectorCapability;
+  queryHints: string[];
+  rateLimit?: string;
+  bestFor?: string[];
+};
+
 export interface LiteratureConnector {
   id: string;
   name: string;
   description: string;
+  metadata?: ConnectorMetadata;
   search(input: LiteratureSearchInput): Promise<PaperHit[]>;
   fetch?(id: string): Promise<PaperHit | unknown>;
 }
@@ -66,22 +96,105 @@ export function getLiteratureConnectorRegistry(services: RuntimeServices): Liter
   return registry;
 }
 
+class SourceRequestError extends Error {
+  constructor(
+    readonly errorType: SourceErrorType,
+    readonly retryable: boolean,
+    message: string,
+    readonly status?: number
+  ) {
+    super(message);
+    this.name = "SourceRequestError";
+  }
+}
+
 async function getJson<T>(url: string, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(url, { headers: { "user-agent": "jiuwen-sci/0.1", ...(headers ?? {}) } });
-  if (!res.ok) throw new RuntimeError("HTTP_ERROR", `${res.status} ${res.statusText}: ${url}`);
+  const res = await requestWithRetry(url, headers);
   return res.json() as Promise<T>;
 }
 
-async function getText(url: string): Promise<string> {
-  const res = await fetch(url, { headers: { "user-agent": "jiuwen-sci/0.1" } });
-  if (!res.ok) throw new RuntimeError("HTTP_ERROR", `${res.status} ${res.statusText}: ${url}`);
+async function getText(url: string, headers?: Record<string, string>): Promise<string> {
+  const res = await requestWithRetry(url, headers);
   return res.text();
+}
+
+async function requestWithRetry(url: string, headers?: Record<string, string>, attempts = 3): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), 20000);
+      const res = await fetch(url, { headers: { "user-agent": "jiuwen-sci/0.1", ...(headers ?? {}) }, signal: controller.signal });
+      clearTimeout(timeout);
+      timeout = undefined;
+      if (res.ok) return res;
+      const classified = classifyHttpError(res.status, `${res.status} ${res.statusText}: ${url}`);
+      if (!classified.retryable || attempt === attempts) throw classified;
+      await sleep(250 * attempt * attempt);
+    } catch (error) {
+      if (timeout) clearTimeout(timeout);
+      lastError = error;
+      const requestError = toSourceRequestError(error, url);
+      if (!requestError.retryable || attempt === attempts) throw requestError;
+      await sleep(250 * attempt * attempt);
+    }
+  }
+  throw toSourceRequestError(lastError, url);
+}
+
+function classifyHttpError(status: number, message: string): SourceRequestError {
+  if (status === 429) return new SourceRequestError("rate_limited", true, message, status);
+  if (status === 404) return new SourceRequestError("not_found", false, message, status);
+  if (status >= 500) return new SourceRequestError("server_error", true, message, status);
+  if (status >= 400) return new SourceRequestError("bad_request", false, message, status);
+  return new SourceRequestError("unknown", false, message, status);
+}
+
+function toSourceRequestError(error: unknown, url: string): SourceRequestError {
+  if (error instanceof SourceRequestError) return error;
+  if (error instanceof Error && error.name === "AbortError") return new SourceRequestError("timeout", true, `Request timed out: ${url}`);
+  if (error instanceof Error) return new SourceRequestError("network", true, error.message);
+  return new SourceRequestError("unknown", true, String(error));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sourceError(db: string, operation: SourceError["operation"], error: unknown): SourceError {
+  const requestError = toSourceRequestError(error, `${db}:${operation}`);
+  return {
+    ok: false,
+    db,
+    operation,
+    errorType: requestError.errorType,
+    retryable: requestError.retryable,
+    message: requestError.message,
+    guidance: sourceErrorGuidance(requestError.errorType, operation),
+    status: requestError.status
+  };
+}
+
+function sourceErrorGuidance(errorType: SourceErrorType, operation: SourceError["operation"]): string {
+  if (errorType === "rate_limited") return "Back off and retry later; reduce limit or prefer a connector with an API key.";
+  if (errorType === "timeout" || errorType === "server_error" || errorType === "network") return `Retry ${operation} or continue with other sources while preserving this source error.`;
+  if (errorType === "bad_request") return "Revise the query syntax or identifier before retrying.";
+  if (errorType === "not_found") return "Try DOI, source-native identifier, or another metadata source.";
+  if (errorType === "unsupported") return "Use another connector that supports this operation.";
+  return "Record the source error and continue with corroborating databases.";
 }
 
 export class OpenAlexConnector implements LiteratureConnector {
   id = "openalex";
   name = "OpenAlex";
   description = "Search OpenAlex works metadata and DOI-linked scholarly records.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "fetch" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use broad natural-language scholarly concepts.", "Prefer English synonyms for cross-disciplinary topics.", "DOI and OpenAlex work IDs are accepted by fetch."],
+    rateLimit: "Public API; use polite request rates and consider mailto for heavy use.",
+    bestFor: ["broad scholarly discovery", "citation counts", "DOI coverage", "open access links"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const url = new URL("https://api.openalex.org/works");
     url.searchParams.set("search", input.query);
@@ -98,12 +211,29 @@ export class OpenAlexConnector implements LiteratureConnector {
       url: item.landing_page_url ?? item.id,
       sourceDb: "openalex",
       citationCount: item.cited_by_count,
+      references: item.referenced_works,
+      citations: item.cited_by_api_url ? [item.cited_by_api_url] : undefined,
       raw: item
     }));
   }
-  async fetch(id: string): Promise<unknown> {
-    const key = id.startsWith("http") ? id.replace(/^https:\/\/openalex.org\//, "") : id;
-    return getJson(`https://api.openalex.org/works/${encodeURIComponent(key)}`);
+  async fetch(id: string): Promise<PaperHit | unknown> {
+    const key = normalizeOpenAlexWorkId(id);
+    const item = await getJson<any>(`https://api.openalex.org/works/${encodeURIComponent(key)}`);
+    return {
+      id: item.id,
+      title: item.title ?? item.display_name ?? "Untitled",
+      abstract: reconstructOpenAlexAbstract(item.abstract_inverted_index),
+      authors: (item.authorships ?? []).map((a: any) => a.author?.display_name).filter(Boolean),
+      year: item.publication_year,
+      venue: item.primary_location?.source?.display_name,
+      doi: normalizeDoi(item.doi),
+      url: item.landing_page_url ?? item.id,
+      sourceDb: "openalex",
+      citationCount: item.cited_by_count,
+      references: item.referenced_works,
+      citations: item.cited_by_api_url ? [item.cited_by_api_url] : undefined,
+      raw: item
+    };
   }
 }
 
@@ -111,6 +241,12 @@ export class ArxivConnector implements LiteratureConnector {
   id = "arxiv";
   name = "arXiv";
   description = "Search arXiv preprints and metadata.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "none" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use English technical terms.", "For topic searches, include field terms such as machine learning, physics, biology, or materials.", "Fetch accepts an arXiv ID or arXiv URL."],
+    rateLimit: "arXiv asks clients to make no more than one request every three seconds for repeated API calls.",
+    bestFor: ["preprints", "computer science", "physics", "math", "quantitative biology"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const url = new URL("https://export.arxiv.org/api/query");
     url.searchParams.set("search_query", `all:${input.query}`);
@@ -130,9 +266,32 @@ export class ArxivConnector implements LiteratureConnector {
         doi: normalizeDoi(text(entry, "arxiv:doi")),
         url: id,
         sourceDb: "arxiv",
-        raw: entry
+        raw: { entry, pdfUrl: arxivPdfUrl(entry), categories: arxivCategories(entry) }
       };
     });
+  }
+  async fetch(id: string): Promise<PaperHit | null> {
+    const arxivId = normalizeArxivId(id);
+    if (!arxivId) return null;
+    const url = new URL("https://export.arxiv.org/api/query");
+    url.searchParams.set("id_list", arxivId);
+    url.searchParams.set("max_results", "1");
+    const xml = await getText(url.toString());
+    const entry = xml.match(/<entry>([\s\S]*?)<\/entry>/)?.[1] ?? "";
+    if (!entry) return null;
+    const entryId = text(entry, "id");
+    return {
+      id: entryId || arxivId,
+      title: clean(text(entry, "title")) || "Untitled",
+      abstract: clean(text(entry, "summary")),
+      authors: [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((a) => clean(a[1] ?? "")).filter(Boolean),
+      year: Number((text(entry, "published") || "").slice(0, 4)) || undefined,
+      venue: "arXiv",
+      doi: normalizeDoi(text(entry, "arxiv:doi")),
+      url: entryId || `https://arxiv.org/abs/${arxivId}`,
+      sourceDb: "arxiv",
+      raw: { entry, pdfUrl: arxivPdfUrl(entry), categories: arxivCategories(entry) }
+    };
   }
 }
 
@@ -140,6 +299,11 @@ export class CrossrefConnector implements LiteratureConnector {
   id = "crossref";
   name = "Crossref";
   description = "Cross-publisher DOI metadata and citation records.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "search_result" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use article titles, DOI fragments, author names, or concise topic terms.", "Crossref is best used as DOI metadata corroboration rather than topical recall."],
+    bestFor: ["DOI metadata", "publisher records", "bibliographic verification"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const url = new URL("https://api.crossref.org/works");
     url.searchParams.set("query", input.query);
@@ -156,6 +320,7 @@ export class CrossrefConnector implements LiteratureConnector {
       url: item.URL,
       sourceDb: "crossref",
       citationCount: item["is-referenced-by-count"],
+      references: (item.reference ?? []).map((r: any) => r.DOI ? `https://doi.org/${r.DOI}` : r.article_title).filter(Boolean),
       raw: item
     }));
   }
@@ -170,6 +335,12 @@ export class PubMedConnector implements LiteratureConnector {
   id = "pubmed";
   name = "PubMed";
   description = "Biomedical literature abstracts and citations from NCBI.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "none" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use biomedical concepts, MeSH-like terms, gene/protein names, and disease terms.", "Best used for life-science and clinical questions."],
+    rateLimit: "NCBI E-utilities public rate limits apply; use an API key for heavy use.",
+    bestFor: ["biomedicine", "clinical literature", "life sciences"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const size = Math.min(input.limit ?? 25, 50);
     const esearch = await getJson<any>(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&sort=relevance&retmax=${size}&term=${encodeURIComponent(input.query)}`);
@@ -199,6 +370,11 @@ export class EuropePmcConnector implements LiteratureConnector {
   id = "europepmc";
   name = "Europe PMC";
   description = "Life-science literature and full-text metadata from Europe PMC.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "search_result" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use life-science terms and DOI/PMID identifiers.", "Good companion source for PubMed when full-text metadata matters."],
+    bestFor: ["life sciences", "open full text metadata", "citation counts"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const size = Math.min(input.limit ?? 25, 50);
     const json = await getJson<any>(`https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(input.query)}&format=json&resultType=core&pageSize=${size}`);
@@ -228,11 +404,17 @@ export class SemanticScholarConnector implements LiteratureConnector {
   id = "semantic-scholar";
   name = "Semantic Scholar";
   description = "Academic graph metadata, citation counts, references, and citations.";
+  metadata = {
+    capabilities: { search: true, fetch: true, citationGraph: "fetch" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Use paper titles for precise fetch/search.", "Use broad English topic terms for graph discovery.", "API key improves reliability and rate limits."],
+    rateLimit: "Unauthenticated Graph API is rate limited; set SEMANTIC_SCHOLAR_API_KEY for sustained use.",
+    bestFor: ["citation graph", "references and citations", "cross-domain academic metadata"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const limit = Math.min(input.limit ?? 25, 50);
     const key = process.env.SEMANTIC_SCHOLAR_API_KEY?.trim();
     const json = await getJson<any>(
-      `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(input.query)}&limit=${limit}&fields=title,abstract,url,year,venue,citationCount,externalIds,authors.name`,
+      `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(input.query)}&limit=${limit}&fields=title,abstract,url,year,venue,citationCount,externalIds,authors.name,openAccessPdf`,
       key ? { "x-api-key": key } : undefined
     );
     return (json.data ?? []).map((p: any): PaperHit => ({
@@ -252,7 +434,7 @@ export class SemanticScholarConnector implements LiteratureConnector {
   async fetch(id: string): Promise<unknown> {
     const key = process.env.SEMANTIC_SCHOLAR_API_KEY?.trim();
     return getJson(
-      `https://api.semanticscholar.org/graph/v1/paper/${id.trim()}?fields=title,abstract,url,year,venue,citationCount,externalIds,authors.name,references.paperId,references.title,citations.paperId,citations.title`,
+      `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(id.trim())}?fields=title,abstract,url,year,venue,citationCount,externalIds,authors.name,openAccessPdf,references.paperId,references.title,references.year,references.externalIds,references.url,citations.paperId,citations.title,citations.year,citations.externalIds,citations.url`,
       key ? { "x-api-key": key } : undefined
     );
   }
@@ -267,6 +449,11 @@ export class BioRxivConnector implements LiteratureConnector {
     this.name = server === "biorxiv" ? "bioRxiv" : "medRxiv";
     this.description = `${this.name} preprint metadata from Cold Spring Harbor.`;
   }
+  metadata = {
+    capabilities: { search: true, fetch: false, citationGraph: "none" as const, abstracts: true, doi: true, fullTextLinks: true },
+    queryHints: ["Searches recent preprints by local keyword filtering.", "Use concise biomedical terms; broad generic terms can be noisy."],
+    bestFor: ["recent biomedical preprints", "pre-publication findings"]
+  };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const limit = input.limit ?? 25;
     const from = new Date(Date.now() - 1000 * 60 * 60 * 24 * 365 * 3).toISOString().slice(0, 10);
@@ -315,6 +502,67 @@ function normalizeDoi(value?: string): string | undefined {
   return doi || undefined;
 }
 
+function normalizeOpenAlexWorkId(value: string): string {
+  const trimmed = value.trim();
+  if (/^https:\/\/openalex\.org\/W/i.test(trimmed)) return trimmed.replace(/^https:\/\/openalex\.org\//i, "");
+  if (/^W\d+$/i.test(trimmed)) return trimmed;
+  return trimmed.replace(/^https?:\/\/api\.openalex\.org\/works\//i, "");
+}
+
+function normalizeArxivId(value: string): string | undefined {
+  const trimmed = value.trim();
+  const fromUrl = trimmed.match(/arxiv\.org\/(?:abs|pdf)\/([^?#\s]+)/i)?.[1];
+  const raw = (fromUrl ?? trimmed).replace(/\.pdf$/i, "");
+  const match = raw.match(/(?:arXiv:)?([a-z-]+\/\d{7}|\d{4}\.\d{4,5})(v\d+)?/i);
+  return match?.[0]?.replace(/^arXiv:/i, "");
+}
+
+function arxivPdfUrl(entry: string): string | undefined {
+  return entry.match(/<link[^>]+title="pdf"[^>]+href="([^"]+)"/)?.[1]
+    ?? entry.match(/<link[^>]+href="([^"]+\.pdf[^"]*)"/)?.[1];
+}
+
+function arxivCategories(entry: string): string[] {
+  return [...entry.matchAll(/<category[^>]+term="([^"]+)"/g)].map((m) => m[1]).filter(Boolean);
+}
+
+function connectorCapability(connector: LiteratureConnector): ConnectorMetadata {
+  return connector.metadata ?? {
+    capabilities: {
+      search: true,
+      fetch: Boolean(connector.fetch),
+      citationGraph: connector.fetch ? "fetch" : "none",
+      abstracts: true,
+      doi: true,
+      fullTextLinks: false
+    },
+    queryHints: ["Use concise scholarly keywords and source-native identifiers where available."],
+    bestFor: ["general literature metadata"]
+  };
+}
+
+function extractCitationGraph(record: unknown): { references: any[]; citations: any[] } {
+  const value = record as any;
+  if (!value) return { references: [], citations: [] };
+  return {
+    references: Array.isArray(value.references) ? value.references : [],
+    citations: Array.isArray(value.citations) ? value.citations : []
+  };
+}
+
+function citationGraphSummary(items: any[]): any[] {
+  return items.slice(0, 25).map((item) => {
+    if (typeof item === "string") return { id: item };
+    return {
+      id: item.paperId ?? item.id ?? item.DOI ?? item.doi,
+      title: item.title ?? item.article_title,
+      year: item.year,
+      doi: normalizeDoi(item.externalIds?.DOI ?? item.DOI ?? item.doi),
+      url: item.url
+    };
+  });
+}
+
 const objectSchema = { type: "object" };
 const requiredString = { type: "string", minLength: 1 };
 const paperArray = { type: "array", items: { type: "object" } };
@@ -328,7 +576,21 @@ export const scienceListDbsTool: ToolDefinition<any, any> = {
   permission: { kind: "network", default: "allow" },
   async execute(ctx) {
     const registry = getLiteratureConnectorRegistry(ctx.runtime);
-    return { databases: registry.list().map((db) => ({ id: db.id, name: db.name, description: db.description, capabilities: ["search", db.fetch ? "fetch" : undefined].filter(Boolean) })) };
+    return {
+      databases: registry.list().map((db) => {
+        const metadata = connectorCapability(db);
+        return {
+          id: db.id,
+          name: db.name,
+          description: db.description,
+          capabilities: metadata.capabilities,
+          operations: ["search", db.fetch ? "fetch" : undefined].filter(Boolean),
+          queryHints: metadata.queryHints,
+          rateLimit: metadata.rateLimit,
+          bestFor: metadata.bestFor ?? []
+        };
+      })
+    };
   }
 };
 
@@ -347,11 +609,11 @@ export const scienceSearchTool: ToolDefinition<any, any> = {
       const results = await connector.search({ query: String(input.query), limit: Number(input.limit ?? 25) });
       const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_results", db: input.db, query: input.query, results }, null, 2) });
       await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: `Search results from ${input.db}` }], edges: [] });
-      return { db: input.db, query: input.query, count: results.length, results, artifactId: artifact.id };
+      return { ok: true, db: input.db, query: input.query, count: results.length, results, artifactId: artifact.id };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db: input.db, query: input.query, error: message }, null, 2) });
-      return { db: input.db, query: input.query, count: 0, results: [], error: message, artifactId: artifact.id };
+      const structuredError = sourceError(String(input.db), "search", error);
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db: input.db, query: input.query, error: structuredError }, null, 2) });
+      return { ...structuredError, query: input.query, count: 0, results: [], artifactId: artifact.id };
     }
   }
 };
@@ -365,10 +627,21 @@ export const paperFetchTool: ToolDefinition<any, any> = {
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
     const connector = getLiteratureConnectorRegistry(ctx.runtime).get(String(input.db));
-    if (!connector?.fetch) return { db: input.db, id: input.id, fetched: false, record: null };
-    const record = await connector.fetch(String(input.id));
-    const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "paper_fetch", db: input.db, id: input.id, record }, null, 2) });
-    return { db: input.db, id: input.id, fetched: true, record, artifactId: artifact.id };
+    if (!connector) throw new RuntimeError("LITERATURE_DB_NOT_FOUND", String(input.db));
+    if (!connector.fetch) {
+      const error = sourceError(String(input.db), "fetch", new SourceRequestError("unsupported", false, `Connector ${input.db} does not support fetch.`));
+      return { ...error, id: input.id, fetched: false, record: null };
+    }
+    try {
+      const record = await connector.fetch(String(input.id));
+      const graph = extractCitationGraph(record);
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "paper_fetch", db: input.db, id: input.id, record, citationGraph: graph }, null, 2) });
+      return { ok: true, db: input.db, id: input.id, fetched: true, record, citationGraph: graph, artifactId: artifact.id };
+    } catch (error) {
+      const structuredError = sourceError(String(input.db), "fetch", error);
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "paper_fetch_error", db: input.db, id: input.id, error: structuredError }, null, 2) });
+      return { ...structuredError, id: input.id, fetched: false, record: null, artifactId: artifact.id };
+    }
   }
 };
 
@@ -402,15 +675,40 @@ export const citationChainTool: ToolDefinition<any, any> = {
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
     const seeds: PaperHit[] = input.papers ?? [];
-    const records = seeds.slice(0, Number(input.limit ?? 5)).map((paper) => ({
-      paperId: paper.id,
-      title: paper.title,
-      references: paper.references ?? [],
-      citations: paper.citations ?? [],
-      note: paper.references?.length || paper.citations?.length ? "connector supplied citation graph metadata" : "no citation graph metadata available"
-    }));
-    const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "citation_chaining", seedCount: seeds.length, records }, null, 2) });
-    return { records, artifactId: artifact.id };
+    const records = [];
+    const errors: SourceError[] = [];
+    for (const paper of seeds.slice(0, Number(input.limit ?? 5))) {
+      const connector = getLiteratureConnectorRegistry(ctx.runtime).get(paper.sourceDb);
+      let fetched: unknown = null;
+      let fetchArtifactId: string | undefined;
+      if (connector?.fetch) {
+        const fetchId = paper.id || paper.doi || paper.url;
+        try {
+          fetched = await connector.fetch(String(fetchId));
+          const fetchArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "citation_chain_fetch", db: paper.sourceDb, id: fetchId, record: fetched }, null, 2) });
+          fetchArtifactId = fetchArtifact.id;
+        } catch (error) {
+          errors.push(sourceError(paper.sourceDb, "citation_chain", error));
+        }
+      }
+      const graph = extractCitationGraph(fetched ?? paper);
+      const references = citationGraphSummary(graph.references.length ? graph.references : (paper.references ?? []));
+      const citations = citationGraphSummary(graph.citations.length ? graph.citations : (paper.citations ?? []));
+      records.push({
+        paperId: paper.id,
+        title: paper.title,
+        sourceDb: paper.sourceDb,
+        fetched: Boolean(fetched),
+        fetchArtifactId,
+        references,
+        citations,
+        referenceCount: references.length,
+        citationCount: citations.length,
+        note: references.length || citations.length ? "citation graph metadata collected" : connector?.fetch ? "fetch returned no citation graph metadata" : "connector does not support fetch"
+      });
+    }
+    const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "citation_chaining", seedCount: seeds.length, records, errors }, null, 2) });
+    return { ok: errors.length === 0, records, errors, artifactId: artifact.id };
   }
 };
 
@@ -601,12 +899,16 @@ export const literatureReviewStageContract: StageContractDefinition = {
           const out = result.output as any;
           allPapers.push(...(out.results ?? []));
           searchCounts[db] = out.count ?? 0;
-          if (out.error) sourceErrors.push({ db, error: out.error });
+          if (out.ok === false) sourceErrors.push(out);
+          else if (out.error) sourceErrors.push({ db, error: out.error });
           if (out.artifactId) searchArtifactIds.push(out.artifactId);
         }
-        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining: 0 }, null, 2) });
         const chain = await ctx.tool({ toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
         const citationChainArtifactId = (chain.output as any).artifactId as string;
+        const citationChainRecords = (chain.output as any).records ?? [];
+        const recordsIdentifiedThroughCitationChaining = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
+        if (Array.isArray((chain.output as any).errors)) sourceErrors.push(...(chain.output as any).errors);
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining }, null, 2) });
         const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
         const deduped = (dedupe.output as any).papers as PaperHit[];
         const duplicates = (dedupe.output as any).duplicates ?? [];

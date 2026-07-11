@@ -131,6 +131,77 @@ test("literature workflow runs with fake connector and creates traceable report"
   }
 });
 
+test("literature tools expose source capabilities and structured source errors", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-error-source",
+      name: "Fake Error Source",
+      description: "Fake connector for source error tests",
+      metadata: {
+        capabilities: { search: true, fetch: false, citationGraph: "none", abstracts: false, doi: false, fullTextLinks: false },
+        queryHints: ["Use this only in tests."],
+        bestFor: ["testing"]
+      },
+      async search() {
+        throw new Error("upstream unavailable");
+      }
+    });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "source errors", cwd: runtime.services.config.cwd });
+    const toolRuntime = new ToolRuntime(runtime.services);
+    const dbs = await toolRuntime.execute({ sessionId: session.id, agentId: "research-orchestrator", toolId: "science_list_dbs", input: {} });
+    const fakeDb = dbs.output.databases.find((db) => db.id === "fake-error-source");
+    assert.equal(fakeDb.capabilities.search, true);
+    assert.deepEqual(fakeDb.queryHints, ["Use this only in tests."]);
+
+    const search = await toolRuntime.execute({ sessionId: session.id, agentId: "research-orchestrator", toolId: "science_search", input: { db: "fake-error-source", query: "x", limit: 1 } });
+    assert.equal(search.output.ok, false);
+    assert.equal(search.output.operation, "search");
+    assert.equal(typeof search.output.errorType, "string");
+    assert.equal(typeof search.output.guidance, "string");
+    assert.equal(search.output.count, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("citation chain fetches connector citation graph metadata", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-citation-graph",
+      name: "Fake Citation Graph",
+      description: "Fake connector for citation chaining",
+      async search() {
+        return [];
+      },
+      async fetch(id) {
+        return {
+          id,
+          references: [{ paperId: "ref-1", title: "Reference paper", year: 2020, externalIds: { DOI: "10.1/ref" } }],
+          citations: [{ paperId: "cite-1", title: "Citing paper", year: 2025, externalIds: { DOI: "10.1/cite" } }]
+        };
+      }
+    });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "citation graph", cwd: runtime.services.config.cwd });
+    const result = await new ToolRuntime(runtime.services).execute({
+      sessionId: session.id,
+      agentId: "research-orchestrator",
+      toolId: "citation_chain",
+      input: { papers: [{ id: "seed-1", title: "Seed", sourceDb: "fake-citation-graph" }], limit: 1 }
+    });
+    assert.equal(result.output.ok, true);
+    assert.equal(result.output.records[0].fetched, true);
+    assert.equal(result.output.records[0].referenceCount, 1);
+    assert.equal(result.output.records[0].citationCount, 1);
+    assert.equal(result.output.records[0].references[0].doi, "10.1/ref");
+  } finally {
+    await cleanup();
+  }
+});
+
 test("registered pack workflow is selected for literature-like exec input", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {
