@@ -125,6 +125,7 @@ export type CapabilityPack = {
   tools?: ToolDefinition[];
   reviewers?: ReviewerDefinition[];
   workflows?: WorkflowDefinition[];
+  stageContracts?: StageContractDefinition[];
   activate?(services: RuntimeServices): void;
 };
 
@@ -149,6 +150,115 @@ export type ReviewerDefinition = {
   name: string;
   description: string;
   review(ctx: { sessionId: string; artifactIds: string[]; services: RuntimeServices }): Promise<{ findingIds: string[]; blockingFindingIds: string[]; summary: string }>;
+};
+
+export type ArtifactRequirement = {
+  type?: string;
+  mediaType?: string;
+  stage?: string;
+  minCount?: number;
+  required?: boolean;
+};
+
+export type StageVerifierResult = {
+  ok: boolean;
+  message: string;
+  severity?: "blocking" | "major" | "minor" | "info";
+  category?: string;
+  targetRef?: string;
+};
+
+export type StageVerifierContext = {
+  sessionId: string;
+  services: RuntimeServices;
+  contract: StageContractDefinition;
+  stage: StageSpec;
+  artifactIds: string[];
+  state: Record<string, unknown>;
+};
+
+export type StageVerifierDefinition = {
+  id: string;
+  description: string;
+  verify(ctx: StageVerifierContext): Promise<StageVerifierResult>;
+};
+
+export type StageExecutionContext = {
+  sessionId: string;
+  services: RuntimeServices;
+  contract: StageContractDefinition;
+  stage: StageSpec;
+  attempt: number;
+  feedback: string[];
+  agentTask?: TaskOutput;
+  input: string;
+  metadata: Record<string, unknown>;
+  artifactIds: string[];
+  state: Record<string, unknown>;
+  task(input: TaskInput): Promise<TaskOutput>;
+  tool(input: { toolId: string; input: unknown }): Promise<{ toolCallId: string; output: unknown }>;
+  createArtifact(input: CreateArtifactInput): Promise<Artifact>;
+  recordProvenance(input: RecordProvenanceInput): Promise<void>;
+};
+
+export type StageExecutionResult = {
+  output?: string;
+  artifactIds?: string[];
+  statePatch?: Record<string, unknown>;
+  nextStageId?: string;
+  status?: "completed" | "partial" | "failed";
+};
+
+export type StageTransition = {
+  when: "passed" | "failed" | "always";
+  stageId?: string;
+};
+
+export type StageReviewPolicy = {
+  reviewerId?: string;
+  agentId?: string;
+  mode?: "always" | "on_failure" | "never";
+};
+
+export type StageGateVerifierPolicy = {
+  id: string;
+  hardGate?: boolean;
+};
+
+export type StageGateDecisionRule = {
+  when: "passed" | "failed" | "hard_gate_failed" | "verifier_failed" | "review_blocking" | "review_major" | (string & {});
+  action: "next" | "retry_stage" | "go_to_stage" | "partial" | "fail" | "continue";
+  stageId?: string;
+};
+
+export type StageGatePolicy = {
+  deterministic?: StageGateVerifierPolicy[];
+  semantic?: StageReviewPolicy;
+  rules?: StageGateDecisionRule[];
+};
+
+export type StageSpec = {
+  id: string;
+  name?: string;
+  goal: string;
+  agentId?: string;
+  allowedTools?: string[];
+  requiredArtifacts?: ArtifactRequirement[];
+  verifiers?: string[];
+  review?: StageReviewPolicy;
+  retryPolicy?: { maxAttempts?: number; onFailure?: "retry_stage" | "fail" | "continue" };
+  gate?: StageGatePolicy;
+  next?: StageTransition[];
+  run?(ctx: StageExecutionContext): Promise<StageExecutionResult>;
+};
+
+export type StageContractDefinition = {
+  id: string;
+  name: string;
+  description: string;
+  initialStageId: string;
+  stages: StageSpec[];
+  maxStages?: number;
 };
 
 export type RuntimeConfig = {
@@ -423,20 +533,34 @@ export class InMemoryToolRegistry {
 export class InMemoryReviewerRegistry {
   private reviewers = new Map<string, ReviewerDefinition>();
   register(reviewer: ReviewerDefinition): void { this.reviewers.set(reviewer.id, reviewer); }
+  get(id: string): ReviewerDefinition | null { return this.reviewers.get(id) ?? null; }
   list(): ReviewerDefinition[] { return [...this.reviewers.values()]; }
+}
+
+export class InMemoryStageVerifierRegistry {
+  private verifiers = new Map<string, StageVerifierDefinition>();
+  register(verifier: StageVerifierDefinition): void {
+    if (this.verifiers.has(verifier.id)) throw new RuntimeError("VERIFIER_DUPLICATE", verifier.id);
+    this.verifiers.set(verifier.id, verifier);
+  }
+  get(id: string): StageVerifierDefinition | null { return this.verifiers.get(id) ?? null; }
+  list(): StageVerifierDefinition[] { return [...this.verifiers.values()]; }
 }
 
 export class InMemoryPackRegistry {
   private packs = new Map<string, CapabilityPack>();
   private workflows = new Map<string, WorkflowDefinition>();
+  private stageContracts = new Map<string, StageContractDefinition>();
   register(pack: CapabilityPack): void {
     if (this.packs.has(pack.id)) return;
     this.packs.set(pack.id, pack);
     for (const workflow of pack.workflows ?? []) this.workflows.set(workflow.id, workflow);
+    for (const contract of pack.stageContracts ?? []) this.stageContracts.set(contract.id, contract);
   }
   get(id: string): CapabilityPack | null { return this.packs.get(id) ?? null; }
   list(): CapabilityPack[] { return [...this.packs.values()]; }
   getWorkflow(id: string): WorkflowDefinition | null { return this.workflows.get(id) ?? null; }
+  getStageContract(id: string): StageContractDefinition | null { return this.stageContracts.get(id) ?? null; }
   workflowCatalog(): { packId: string; packName: string; workflowId: string; workflowName: string; description: string }[] {
     return [...this.packs.values()].flatMap((pack) => (pack.workflows ?? []).map((workflow) => ({
       packId: pack.id,
@@ -444,6 +568,15 @@ export class InMemoryPackRegistry {
       workflowId: workflow.id,
       workflowName: workflow.name,
       description: workflow.description
+    })));
+  }
+  stageContractCatalog(): { packId: string; packName: string; contractId: string; contractName: string; description: string }[] {
+    return [...this.packs.values()].flatMap((pack) => (pack.stageContracts ?? []).map((contract) => ({
+      packId: pack.id,
+      packName: pack.name,
+      contractId: contract.id,
+      contractName: contract.name,
+      description: contract.description
     })));
   }
 }
@@ -497,6 +630,7 @@ export type RuntimeServices = {
   agentRegistry: InMemoryAgentRegistry;
   toolRegistry: InMemoryToolRegistry;
   reviewerRegistry: InMemoryReviewerRegistry;
+  verifierRegistry: InMemoryStageVerifierRegistry;
   packRegistry: InMemoryPackRegistry;
   providerRouter: DefaultProviderRouter;
   promptAssembler: DefaultPromptAssembler;
@@ -536,6 +670,7 @@ export async function createRuntimeServices(config: RuntimeConfig, eventSink?: (
     agentRegistry: new InMemoryAgentRegistry(),
     toolRegistry: new InMemoryToolRegistry(),
     reviewerRegistry: new InMemoryReviewerRegistry(),
+    verifierRegistry: new InMemoryStageVerifierRegistry(),
     packRegistry: new InMemoryPackRegistry(),
     providerRouter: new DefaultProviderRouter(),
     promptAssembler: new DefaultPromptAssembler(),
@@ -549,6 +684,7 @@ export async function createRuntimeServices(config: RuntimeConfig, eventSink?: (
   services.providerRouter.register(new OpenAICompatibleProvider("ark", config.providers.openaiCompatible));
   registerCoreAgents(services.agentRegistry);
   registerCoreTools(services.toolRegistry);
+  registerCoreStageVerifiers(services.verifierRegistry);
   return services;
 }
 
@@ -564,6 +700,31 @@ export function registerCoreTools(registry: InMemoryToolRegistry): void {
   registry.register(finalizeTool);
   registry.register(taskTool);
   registry.register(reviewFindingWriteTool);
+}
+
+export function registerCoreStageVerifiers(registry: InMemoryStageVerifierRegistry): void {
+  registry.register({
+    id: "artifact_requirements_met",
+    description: "Verify that the stage required artifact declarations are satisfied.",
+    async verify(ctx) {
+      for (const req of ctx.stage.requiredArtifacts ?? []) {
+        const count = await countMatchingArtifacts(ctx.services, ctx.artifactIds, req);
+        const minCount = req.minCount ?? (req.required === false ? 0 : 1);
+        if (count < minCount) return { ok: false, message: `Required artifact not found: ${JSON.stringify(req)}`, severity: "major", category: "missing_artifact" };
+      }
+      return { ok: true, message: "Artifact requirements met." };
+    }
+  });
+  registry.register({
+    id: "no_open_blocking_findings",
+    description: "Verify that the current session has no open blocking review findings.",
+    async verify(ctx) {
+      const blocking = await ctx.services.reviewStore.listOpenBlocking(ctx.sessionId);
+      return blocking.length
+        ? { ok: false, message: `Open blocking findings remain: ${blocking.map((f) => f.id).join(", ")}`, severity: "blocking", category: "blocking_findings" }
+        : { ok: true, message: "No open blocking findings." };
+    }
+  });
 }
 
 const objectSchema = { type: "object" };
@@ -626,7 +787,8 @@ export const taskTool: ToolDefinition<TaskInput, TaskOutput> = {
 
 export class ToolRuntime {
   constructor(private services: RuntimeServices) {}
-  async execute(input: { sessionId: string; agentId: string; toolId: string; input: unknown }): Promise<{ toolCallId: string; output: unknown }> {
+  async execute(input: { sessionId: string; agentId: string; toolId: string; input: unknown; allowedToolIds?: string[] }): Promise<{ toolCallId: string; output: unknown }> {
+    if (input.allowedToolIds && !input.allowedToolIds.includes(input.toolId)) throw new RuntimeError("TOOL_NOT_ALLOWED_IN_STAGE", input.toolId);
     const tool = this.services.toolRegistry.get(input.toolId);
     if (!tool) throw new RuntimeError("TOOL_NOT_FOUND", input.toolId);
     const perm = await this.services.permissionService.check();
@@ -814,6 +976,295 @@ export class WorkflowRunner implements ExecutionRunner {
     await this.services.sessionStore.update(input.sessionId, { status: result.status === "completed" ? "completed" : result.status, artifactIds: result.artifactIds });
     return result;
   }
+}
+
+export class StageContractRunner {
+  constructor(private services: RuntimeServices) {}
+  async run(input: { sessionId: string; contractId: string; userGoal: string; metadata?: Record<string, unknown> }): Promise<RunnerResult> {
+    const contract = this.services.packRegistry.getStageContract(input.contractId);
+    if (!contract) throw new RuntimeError("STAGE_CONTRACT_NOT_FOUND", input.contractId);
+    const stageById = new Map(contract.stages.map((stage) => [stage.id, stage]));
+    let currentId: string | undefined = contract.initialStageId;
+    let status: RuntimeStatus = "completed";
+    let output = "";
+    let artifactIds: string[] = [];
+    let reviewFindingIds: string[] = [];
+    const state: Record<string, unknown> = {};
+    const maxStages = contract.maxStages ?? Math.max(20, contract.stages.length * 3);
+    await this.services.sessionStore.update(input.sessionId, { status: "running" });
+
+    for (let step = 0; currentId && step < maxStages; step++) {
+      const stage = stageById.get(currentId);
+      if (!stage) throw new RuntimeError("STAGE_NOT_FOUND", currentId);
+      await this.services.eventBus.emit({ type: "stage.started", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id });
+      const attempts = Math.max(1, stage.retryPolicy?.maxAttempts ?? 1);
+      let passed = false;
+      let terminalAction: "partial" | "fail" | undefined;
+      let lastResult: StageExecutionResult = {};
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const feedback = (state[`stage.${stage.id}.feedback`] as string[] | undefined) ?? [];
+        lastResult = await this.runStage({ contract, stage, sessionId: input.sessionId, userGoal: input.userGoal, metadata: input.metadata ?? {}, artifactIds, state, attempt, feedback });
+        artifactIds = [...new Set([...artifactIds, ...(lastResult.artifactIds ?? [])])];
+        Object.assign(state, lastResult.statePatch ?? {});
+        output = lastResult.output ?? output;
+
+        const gate = await this.evaluateGate(contract, stage, input.sessionId, artifactIds, state, attempt);
+        artifactIds = [...new Set([...artifactIds, gate.reportArtifactId])];
+        reviewFindingIds.push(...gate.findingIds);
+        if (gate.action === "next" || gate.action === "continue" || gate.action === "go_to_stage") {
+          passed = true;
+          if (gate.action === "go_to_stage") lastResult.nextStageId = gate.nextStageId;
+          await this.services.eventBus.emit({ type: gate.action === "go_to_stage" ? "stage.redirected" : "stage.completed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, attempt, nextStageId: gate.nextStageId });
+          break;
+        }
+        if (gate.action === "partial" || gate.action === "fail") terminalAction = gate.action;
+
+        await this.services.eventBus.emit({ type: "stage.failed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, attempt, messages: gate.messages, action: gate.action });
+        state[`stage.${stage.id}.feedback`] = gate.messages;
+        if (gate.action !== "retry_stage") break;
+      }
+
+      if (!passed && stage.retryPolicy?.onFailure !== "continue") {
+        status = terminalAction === "fail" ? "failed" : "partial";
+        break;
+      }
+      currentId = lastResult.nextStageId ?? resolveStageTransition(stage, passed);
+    }
+
+    if (currentId) status = "partial";
+    const findings = await this.services.reviewStore.listBySession(input.sessionId);
+    reviewFindingIds = [...new Set([...reviewFindingIds, ...findings.map((f) => f.id)])];
+    await this.services.sessionStore.update(input.sessionId, { status: status === "completed" ? "completed" : status, artifactIds: [...new Set(artifactIds)] });
+    return { sessionId: input.sessionId, status, output, artifactIds: [...new Set(artifactIds)], reviewFindingIds };
+  }
+
+  private async runStage(input: { contract: StageContractDefinition; stage: StageSpec; sessionId: string; userGoal: string; metadata: Record<string, unknown>; artifactIds: string[]; state: Record<string, unknown>; attempt: number; feedback: string[] }): Promise<StageExecutionResult> {
+    const { contract, stage, sessionId, userGoal, metadata, state } = input;
+    let artifactIds = input.artifactIds;
+    let agentTask: TaskOutput | undefined;
+    if (stage.agentId) {
+      agentTask = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
+        agentId: stage.agentId,
+        description: `Stage ${stage.id}`,
+        input: renderStageAgentPrompt({ contract, stage, userGoal, attempt: input.attempt, feedback: input.feedback }),
+        contextArtifactIds: artifactIds
+      });
+      artifactIds = [...new Set([...artifactIds, ...agentTask.artifactIds])];
+      state[`stage.${stage.id}.agentTask`] = agentTask;
+    }
+    if (!stage.run) return { artifactIds: agentTask?.artifactIds ?? [], statePatch: agentTask ? { [`stage.${stage.id}.agentTask`]: agentTask } : undefined };
+    const toolRuntime = new ToolRuntime(this.services);
+    const result = await stage.run({
+      sessionId,
+      services: this.services,
+      contract,
+      stage,
+      attempt: input.attempt,
+      feedback: input.feedback,
+      agentTask,
+      input: userGoal,
+      metadata,
+      artifactIds,
+      state,
+      task: (taskInput) => taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), taskInput),
+      tool: (toolInput) => toolRuntime.execute({ sessionId, agentId: stage.agentId ?? "stage-runner", toolId: toolInput.toolId, input: toolInput.input, allowedToolIds: stage.allowedTools }),
+      createArtifact: (artifactInput) => this.services.artifactStore.create({ ...artifactInput, sessionId, createdBy: { sessionId, agentId: stage.agentId ?? "stage-runner", toolId: "stage" } }),
+      recordProvenance: (prov) => this.services.provenanceStore.record(prov)
+    });
+    return {
+      ...result,
+      artifactIds: [...new Set([...(agentTask?.artifactIds ?? []), ...(result.artifactIds ?? [])])],
+      statePatch: { ...(agentTask ? { [`stage.${stage.id}.agentTask`]: agentTask } : {}), ...(result.statePatch ?? {}) }
+    };
+  }
+
+  private async evaluateGate(contract: StageContractDefinition, stage: StageSpec, sessionId: string, artifactIds: string[], state: Record<string, unknown>, attempt: number): Promise<{ action: StageGateDecisionRule["action"]; nextStageId?: string; messages: string[]; findingIds: string[]; reportArtifactId: string }> {
+    const messages: string[] = [];
+    const findingIds: string[] = [];
+    const deterministicResults: (StageVerifierResult & { verifierId: string; hardGate: boolean })[] = [];
+    const semanticFindings: ReviewFinding[] = [];
+    const gate = effectiveGate(stage);
+
+    for (const req of stage.requiredArtifacts ?? []) {
+      const count = await countMatchingArtifacts(this.services, artifactIds, req);
+      const minCount = req.minCount ?? (req.required === false ? 0 : 1);
+      if (count < minCount) {
+        const result = { verifierId: "required_artifact", hardGate: true, ok: false, message: `Missing required artifact for stage ${stage.id}: ${JSON.stringify(req)}`, severity: "blocking" as const, category: "missing_artifact" };
+        deterministicResults.push(result);
+        messages.push(result.message);
+      }
+    }
+
+    for (const policy of gate.deterministic ?? []) {
+      const verifier = this.services.verifierRegistry.get(policy.id);
+      if (!verifier) throw new RuntimeError("VERIFIER_NOT_FOUND", policy.id);
+      const result = await verifier.verify({ sessionId, services: this.services, contract, stage, artifactIds, state });
+      deterministicResults.push({ ...result, verifierId: policy.id, hardGate: policy.hardGate === true });
+      messages.push(result.message);
+      if (!result.ok) {
+        const severity = result.severity ?? "major";
+        const finding = await this.services.reviewStore.create({
+          sessionId,
+          severity,
+          category: result.category ?? `verifier:${policy.id}`,
+          targetType: "stage",
+          targetRef: result.targetRef ?? stage.id,
+          description: result.message,
+          suggestedAction: "Revise the stage output and rerun verification."
+        });
+        findingIds.push(finding.id);
+      }
+    }
+
+    const report = await this.writeVerifierReport({ sessionId, contract, stage, attempt, deterministicResults, messages, state });
+    const artifactIdsWithReport = [...new Set([...artifactIds, report.id])];
+    const deterministicOk = deterministicResults.every((result) => result.ok);
+    const hardGateFailed = deterministicResults.some((result) => !result.ok && result.hardGate);
+    const reviewPolicy = gate.semantic;
+
+    if (reviewPolicy?.mode === "always" || (reviewPolicy?.mode === "on_failure" && !deterministicOk)) {
+      if (reviewPolicy.reviewerId) {
+        const reviewer = this.services.reviewerRegistry.get(reviewPolicy.reviewerId);
+        if (!reviewer) throw new RuntimeError("REVIEWER_NOT_FOUND", reviewPolicy.reviewerId);
+        const review = await reviewer.review({ sessionId, artifactIds: artifactIdsWithReport, services: this.services });
+        findingIds.push(...review.findingIds);
+        semanticFindings.push(...(await this.services.reviewStore.listBySession(sessionId)).filter((finding) => review.findingIds.includes(finding.id)));
+      } else if (reviewPolicy.agentId) {
+        const review = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
+          agentId: reviewPolicy.agentId,
+          description: `Review stage ${stage.id}`,
+          input: `Review stage "${stage.id}" for semantic quality and blocking issues. Use the verifier_report artifact to avoid repeating deterministic checks and focus on semantic risks.`,
+          contextArtifactIds: artifactIdsWithReport
+        });
+        const childFindings = await this.services.reviewStore.listBySession(review.childSessionId);
+        semanticFindings.push(...childFindings);
+        findingIds.push(...childFindings.map((f) => f.id));
+      }
+    }
+
+    const reviewBlocking = semanticFindings.some((finding) => finding.severity === "blocking" && finding.status === "open");
+    const reviewMajor = semanticFindings.some((finding) => finding.severity === "major" && finding.status === "open");
+    const action = decideGateAction({ stage, deterministicOk, hardGateFailed, reviewBlocking, reviewMajor, deterministicResults, semanticFindings });
+    return { ...action, messages: [...messages, ...semanticFindings.map((finding) => finding.description)], findingIds, reportArtifactId: report.id };
+  }
+
+  private async writeVerifierReport(input: { sessionId: string; contract: StageContractDefinition; stage: StageSpec; attempt: number; deterministicResults: (StageVerifierResult & { verifierId: string; hardGate: boolean })[]; messages: string[]; state: Record<string, unknown> }): Promise<Artifact> {
+    const content = {
+      stage: "verifier_report",
+      contractId: input.contract.id,
+      stageId: input.stage.id,
+      attempt: input.attempt,
+      deterministicChecks: input.deterministicResults.map((result) => ({
+        verifierId: result.verifierId,
+        hardGate: result.hardGate,
+        ok: result.ok,
+        severity: result.severity,
+        category: result.category,
+        targetRef: result.targetRef,
+        message: result.message
+      })),
+      messages: input.messages
+    };
+    const artifact = await this.services.artifactStore.create({ sessionId: input.sessionId, type: "json", mediaType: "application/json", content: JSON.stringify(content, null, 2), createdBy: { sessionId: input.sessionId, agentId: "stage-runner", toolId: "verifier" } });
+    input.state[`stage.${input.stage.id}.verifierReportArtifactId`] = artifact.id;
+    return artifact;
+  }
+}
+
+function resolveStageTransition(stage: StageSpec, passed: boolean): string | undefined {
+  const desired = passed ? "passed" : "failed";
+  return stage.next?.find((t) => t.when === desired)?.stageId ?? stage.next?.find((t) => t.when === "always")?.stageId;
+}
+
+function effectiveGate(stage: StageSpec): StageGatePolicy {
+  return {
+    deterministic: stage.gate?.deterministic ?? stage.verifiers?.map((id) => ({ id, hardGate: false })) ?? [],
+    semantic: stage.gate?.semantic ?? stage.review,
+    rules: stage.gate?.rules ?? defaultGateRules(stage)
+  };
+}
+
+function defaultGateRules(stage: StageSpec): StageGateDecisionRule[] {
+  const retryAction = stage.retryPolicy?.onFailure === "continue" ? "continue" : stage.retryPolicy?.onFailure === "fail" ? "partial" : "retry_stage";
+  return [
+    { when: "hard_gate_failed", action: retryAction },
+    { when: "review_blocking", action: retryAction },
+    { when: "review_major", action: retryAction },
+    { when: "verifier_failed", action: retryAction },
+    { when: "passed", action: "next" }
+  ];
+}
+
+function decideGateAction(input: { stage: StageSpec; deterministicOk: boolean; hardGateFailed: boolean; reviewBlocking: boolean; reviewMajor: boolean; deterministicResults: (StageVerifierResult & { verifierId: string; hardGate: boolean })[]; semanticFindings: ReviewFinding[] }): { action: StageGateDecisionRule["action"]; nextStageId?: string } {
+  const gate = effectiveGate(input.stage);
+  const signals = gateSignals(input);
+  const rule = gate.rules?.find((candidate) => signals.some((signal) => gateRuleMatches(candidate.when, signal))) ?? { when: input.deterministicOk ? "passed" : "failed", action: input.deterministicOk ? "next" : "retry_stage" };
+  return { action: rule.action, nextStageId: rule.stageId };
+}
+
+function gateSignals(input: { deterministicOk: boolean; hardGateFailed: boolean; reviewBlocking: boolean; reviewMajor: boolean; deterministicResults: (StageVerifierResult & { verifierId: string; hardGate: boolean })[]; semanticFindings: ReviewFinding[] }): string[] {
+  const signals: string[] = [];
+  if (input.deterministicOk && !input.reviewBlocking && !input.reviewMajor) signals.push("passed");
+  if (!input.deterministicOk || input.reviewBlocking || input.reviewMajor) signals.push("failed");
+  if (input.hardGateFailed) signals.push("hard_gate_failed");
+  for (const result of input.deterministicResults.filter((result) => !result.ok)) {
+    signals.push("verifier_failed");
+    signals.push(`verifier_failed:${result.verifierId}`);
+    if (result.category) signals.push(`verifier_failed:${result.category}`);
+  }
+  if (input.reviewBlocking) signals.push("review_blocking");
+  if (input.reviewMajor) signals.push("review_major");
+  for (const finding of input.semanticFindings.filter((finding) => finding.status === "open")) {
+    signals.push(`review_${finding.severity}`);
+    signals.push(`review_${finding.severity}:${finding.category}`);
+  }
+  return signals;
+}
+
+function gateRuleMatches(ruleWhen: string, signal: string): boolean {
+  return ruleWhen === signal || (ruleWhen.endsWith(":*") && signal.startsWith(ruleWhen.slice(0, -1)));
+}
+
+function renderStageAgentPrompt(input: { contract: StageContractDefinition; stage: StageSpec; userGoal: string; attempt: number; feedback: string[] }): string {
+  const required = input.stage.requiredArtifacts?.length
+    ? input.stage.requiredArtifacts.map((req) => `- ${JSON.stringify(req)}`).join("\n")
+    : "- No required artifacts declared.";
+  const gate = effectiveGate(input.stage);
+  const verifiers = gate.deterministic?.length ? gate.deterministic.map((policy) => `- ${policy.id}${policy.hardGate ? " (hard gate)" : ""}`).join("\n") : "- No verifiers declared.";
+  const allowedTools = input.stage.allowedTools?.length ? input.stage.allowedTools.join(", ") : "all registered tools";
+  const feedback = input.feedback.length ? `\nPrevious verifier/review feedback to fix:\n${input.feedback.map((m) => `- ${m}`).join("\n")}\n` : "";
+  return [
+    `Run stage "${input.stage.id}" for contract "${input.contract.id}".`,
+    `Goal: ${input.stage.goal}`,
+    `User goal:\n${input.userGoal}`,
+    `Attempt: ${input.attempt}`,
+    `Allowed tools: ${allowedTools}`,
+    `Required artifacts:\n${required}`,
+    `Verifiers that will judge completion:\n${verifiers}`,
+    feedback,
+    "Produce the required structured artifacts with artifact_write before finalizing. For JSON artifacts, include the declared stage field exactly. Do not skip a required artifact by only describing it in final text."
+  ].filter(Boolean).join("\n\n");
+}
+
+async function countMatchingArtifacts(services: RuntimeServices, artifactIds: string[], req: ArtifactRequirement): Promise<number> {
+  let count = 0;
+  for (const id of artifactIds) {
+    const artifact = await services.artifactStore.get(id);
+    if (!artifact) continue;
+    if (req.type && artifact.type !== req.type) continue;
+    if (req.mediaType && artifact.mediaType !== req.mediaType) continue;
+    if (req.stage) {
+      try {
+        const parsed = JSON.parse((await services.artifactStore.read(id)).toString("utf8"));
+        if (parsed?.stage !== req.stage) continue;
+      } catch {
+        continue;
+      }
+    }
+    count++;
+  }
+  return count;
 }
 
 export class AgentSessionRunner {

@@ -8,6 +8,7 @@ import {
   DefaultStrategyGuard,
   InMemoryAgentRegistry,
   InMemoryToolRegistry,
+  StageContractRunner,
   ToolRuntime
 } from "@jiuwen-sci/core";
 import { getLiteratureConnectorRegistry, literaturePack } from "@jiuwen-sci/literature-pack";
@@ -121,7 +122,8 @@ test("literature workflow runs with fake connector and creates traceable report"
     const verification = jsonByStage("citation_verification");
     assert.equal(verification.results.length, 1);
     assert.ok(artifacts.some((a) => a.text.includes("@misc") || a.text.includes("@article")));
-    const finalId = result.artifactIds.at(-1);
+    const finalId = artifacts.find((a) => a.text.includes("# PRISMA-Style Literature Review"))?.id;
+    assert.ok(finalId);
     const trace = await runtime.services.provenanceStore.trace(finalId);
     assert.equal(trace.nodes.length, 1);
   } finally {
@@ -149,6 +151,140 @@ test("registered pack workflow is selected for literature-like exec input", asyn
     const session = await runtime.services.sessionStore.get(result.sessionId);
     assert.equal(session.metadata.workflow, "literature-review");
     assert.equal(session.metadata.selectedPack, "literature");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("literature pack registers and runs a stage contract", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    assert.equal(runtime.services.packRegistry.getStageContract("literature-review-prisma-v1").stages.length, 5);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-stage",
+      name: "Fake Stage",
+      description: "Fake test connector for stage contracts",
+      async search() {
+        return [
+          { id: "p-stage", title: "Stage contracts for AI4S literature agents", authors: ["A"], year: 2026, venue: "Test", url: "https://example.test/p-stage", sourceDb: "fake-stage", abstract: "AI4S literature agents need stage contracts, verifiers, evidence, and citation checks." }
+        ];
+      }
+    });
+    const result = await runtime.run({ input: "AI4S literature agents", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-stage"], limit: 1 } });
+    assert.equal(result.status, "completed");
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.started" && event.stageId === "protocol_query"));
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.completed" && event.stageId === "citation_synthesis_review"));
+    const stages = new Set();
+    for (const id of result.artifactIds) {
+      try {
+        const parsed = JSON.parse((await runtime.services.artifactStore.read(id)).toString("utf8"));
+        if (parsed.stage) stages.add(parsed.stage);
+      } catch {}
+    }
+    assert.ok(stages.has("protocol"));
+    assert.ok(stages.has("screening_log"));
+    assert.ok(stages.has("prisma_flow"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage contract retries a failed stage with verifier feedback", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.services.verifierRegistry.register({
+      id: "test_ready",
+      description: "Pass only after the stage used verifier feedback.",
+      async verify(ctx) {
+        return ctx.state.ready === true
+          ? { ok: true, message: "ready" }
+          : { ok: false, message: "not ready", severity: "major", category: "test" };
+      }
+    });
+    const contract = {
+      id: "retry-contract",
+      name: "Retry Contract",
+      description: "Retry verifier feedback contract",
+      initialStageId: "draft",
+      stages: [{
+        id: "draft",
+        goal: "Create a draft only after feedback is available.",
+        requiredArtifacts: [{ type: "json", stage: "draft" }],
+        verifiers: ["artifact_requirements_met", "test_ready"],
+        retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+        run: async (ctx) => {
+          if (!ctx.feedback.length) return { statePatch: { ready: false } };
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "draft", fixed: true }) });
+          return { artifactIds: [artifact.id], statePatch: { ready: true } };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "retry-pack", name: "Retry Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "retry", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "retry-contract", userGoal: "retry" });
+    assert.equal(result.status, "completed");
+    const stages = [];
+    for (const id of result.artifactIds) {
+      try {
+        stages.push(JSON.parse((await runtime.services.artifactStore.read(id)).toString("utf8")).stage);
+      } catch {}
+    }
+    assert.ok(stages.includes("draft"));
+    assert.ok(stages.includes("verifier_report"));
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.failed" && event.stageId === "draft"));
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.completed" && event.stageId === "draft" && event.attempt === 2));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage gate policy can redirect to a pack-defined stage", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.services.verifierRegistry.register({
+      id: "test_redirect",
+      description: "Force redirect once.",
+      async verify(ctx) {
+        return ctx.state.planned ? { ok: true, message: "planned" } : { ok: false, message: "needs planning", severity: "major", category: "needs_planning" };
+      }
+    });
+    const contract = {
+      id: "redirect-contract",
+      name: "Redirect Contract",
+      description: "Gate redirect contract",
+      initialStageId: "work",
+      maxStages: 4,
+      stages: [
+        {
+          id: "work",
+          goal: "Do work after planning.",
+          gate: {
+            deterministic: [{ id: "test_redirect", hardGate: false }],
+            rules: [
+              { when: "verifier_failed:needs_planning", action: "go_to_stage", stageId: "plan" },
+              { when: "passed", action: "next" }
+            ]
+          },
+          next: [{ when: "passed" }],
+          run: async () => ({})
+        },
+        {
+          id: "plan",
+          goal: "Plan then stop.",
+          next: [{ when: "passed" }],
+          run: async (ctx) => {
+            const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "plan" }) });
+            return { artifactIds: [artifact.id], statePatch: { planned: true } };
+          }
+        }
+      ]
+    };
+    runtime.registerPack({ id: "redirect-pack", name: "Redirect Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "redirect", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "redirect-contract", userGoal: "redirect" });
+    assert.equal(result.status, "completed");
+    assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.redirected" && event.stageId === "work" && event.nextStageId === "plan"));
   } finally {
     await cleanup();
   }

@@ -3,8 +3,11 @@ import {
   CapabilityPack,
   RuntimeError,
   RuntimeServices,
+  StageContractDefinition,
+  StageContractRunner,
+  StageVerifierDefinition,
   ToolDefinition,
-  ToolRuntime,
+  WorkflowContext,
   WorkflowDefinition
 } from "@jiuwen-sci/core";
 
@@ -504,141 +507,394 @@ export const literatureReviewWorkflow: WorkflowDefinition = {
   description: "PRISMA-style literature review: multi-database search, screening, eligibility, quality assessment, citation verification, synthesis, and review.",
   defaultStrategy: "workflow_controlled",
   async run(ctx, input) {
-    const question = input.input;
-    const metadata = input.metadata ?? {};
-    const limit = Number(metadata.limit ?? 25);
-    const dbs = Array.isArray(metadata.dbs) && metadata.dbs.length ? metadata.dbs.map(String) : ["openalex", "semantic-scholar", "crossref"];
-    const toolRuntime = new ToolRuntime(ctx.services);
-
-    const criteria = {
-      inclusion: [
-        "IC1: directly addresses the research question",
-        "IC2: contains empirical results, theoretical analysis, or systematic review",
-        "IC3: has identifiable scholarly metadata"
-      ],
-      exclusion: [
-        "EC1: only tangentially mentions the topic",
-        "EC2: insufficient metadata to verify source identity",
-        "EC3: duplicate or superseded record",
-        "EC4: unavailable abstract/summary and low relevance"
-      ]
-    };
-
-    const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question, databases: dbs, limit, criteria, workflow: ["protocol", "identification", "citation_chaining", "deduplication", "screening", "eligibility", "quality_assessment", "evidence_extraction", "contradiction_detection", "citation_verification", "synthesis", "review", "final_report"] }, null, 2) });
-    const queryTask = await ctx.task({ agentId: "literature-query-agent", description: "Generate query plan", input: question });
-    const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "queries", researchQuestion: question, concepts: inferConcepts(question), criteria, selectedQueries: dbs.map((db) => ({ database: db, query: question, rationale: "Primary selected query for v0 PRISMA workflow." })), alternativeQueries: dbs.map((db) => ({ database: db, query: `${question} systematic review`, rationale: "Documented alternative; not executed unless user requests broader recall." })) }, null, 2) });
-
-    const searchTask = await ctx.task({ agentId: "literature-search-agent", description: "Run multi-database search", input: "Run selected query plan and preserve source errors.", contextArtifactIds: [queries.id] });
-    const allPapers: PaperHit[] = [];
-    const searchArtifactIds: string[] = [];
-    const searchCounts: Record<string, number> = {};
-    const sourceErrors: any[] = [];
-    for (const db of dbs) {
-      const result = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "science_search", input: { db, query: question, limit } });
-      const out = result.output as any;
-      allPapers.push(...(out.results ?? []));
-      searchCounts[db] = out.count ?? 0;
-      if (out.error) sourceErrors.push({ db, error: out.error });
-      if (out.artifactId) searchArtifactIds.push(out.artifactId);
-    }
-    const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining: 0 }, null, 2) });
-
-    const chain = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
-    const citationChainArtifactId = (chain.output as any).artifactId as string;
-
-    const dedupe = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "paper_deduplicate", input: { papers: allPapers } });
-    const deduped = (dedupe.output as any).papers as PaperHit[];
-    const duplicates = (dedupe.output as any).duplicates ?? [];
-    const dedupedArtifactId = (dedupe.output as any).artifactId as string;
-
-    const screeningTask = await ctx.task({ agentId: "literature-screening-agent", description: "Screen title and abstracts", input: "Screen candidate papers using IC/EC criteria.", contextArtifactIds: [dedupedArtifactId] });
-    const screeningDecisions = deduped.map((paper) => screenPaper(question, paper));
-    const screenedIn = screeningDecisions.filter((d) => d.decision === "include").map((d) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
-    const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, decisions: screeningDecisions }, null, 2) });
-
-    const eligibilityTask = await ctx.task({ agentId: "literature-eligibility-agent", description: "Assess eligibility", input: "Assess eligible papers using abstracts/full metadata.", contextArtifactIds: [screeningLog.id] });
-    const eligibilityDecisions = screenedIn.map((paper) => assessEligibility(paper));
-    const included = eligibilityDecisions.filter((d) => d.decision === "include").map((d) => screenedIn.find((p) => p.id === d.paperId)!).filter(Boolean).slice(0, Math.min(25, limit));
-    const eligibilityLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "eligibility_log", decisions: eligibilityDecisions }, null, 2) });
-
-    const qualityTask = await ctx.task({ agentId: "literature-quality-agent", description: "Assess evidence quality", input: "Assign evidence quality tiers.", contextArtifactIds: [eligibilityLog.id] });
-    const quality = included.map((paper) => assessQuality(paper));
-    const qualityAssessment = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "quality_assessment", tiers: quality }, null, 2) });
-    const includedStudies = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "included_studies", papers: included }, null, 2) });
-
-    const evidenceRows = included.map((paper, index) => ({
-      evidenceId: `ev_${index + 1}`,
-      paperId: paper.id,
-      claim: `${paper.title} provides ${paper.abstract ? "abstract-level" : "metadata-level"} evidence relevant to "${question}".`,
-      supportType: "context",
-      quoteOrSummary: paper.abstract?.slice(0, 700) || `${paper.title} (${paper.year ?? "n.d."})`,
-      qualityTier: quality.find((q) => q.paperId === paper.id)?.tier ?? "Tier 3",
-      confidence: paper.abstract ? 0.72 : 0.52
-    }));
-    const evidence = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "evidence_table", researchQuestion: question, rows: evidenceRows }, null, 2) });
-
-    const contradictions = detectContradictions(evidenceRows);
-    const contradictionArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "contradiction_detection", contradictions }, null, 2) });
-
-    const citationTask = await ctx.task({ agentId: "literature-citation-agent", description: "Verify citations and write BibTeX", input: "Verify citations and produce BibTeX.", contextArtifactIds: [includedStudies.id] });
-    const citationVerification = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "citation_verify", input: { papers: included } });
-    const citationVerificationArtifactId = (citationVerification.output as any).artifactId as string;
-    const bibtex = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "bibtex_write", input: { papers: included } });
-    const bibtexArtifactId = (bibtex.output as any).artifactId as string;
-
-    const prisma = {
-      recordsIdentifiedThroughDatabaseSearching: allPapers.length,
-      recordsIdentifiedThroughCitationChaining: 0,
-      totalRecordsIdentified: allPapers.length,
-      duplicateRecordsRemoved: duplicates.length,
-      recordsAfterDeduplication: deduped.length,
-      recordsScreened: deduped.length,
-      recordsExcludedTitleAbstract: screeningDecisions.filter((d) => d.decision === "exclude").length,
-      fullTextOrAbstractRecordsAssessed: screenedIn.length,
-      recordsExcludedEligibility: eligibilityDecisions.filter((d) => d.decision === "exclude").length,
-      studiesIncludedInSynthesis: included.length,
-      tierCounts: countTiers(quality)
-    };
-    const prismaFlow = await toolRuntime.execute({ sessionId: ctx.sessionId, agentId: "workflow", toolId: "prisma_flow_write", input: prisma });
-    const prismaFlowArtifactId = (prismaFlow.output as any).artifactId as string;
-
-    const synthesisTask = await ctx.task({ agentId: "literature-synthesis-agent", description: "Synthesize evidence", input: "Produce thematic synthesis grounded in evidence rows.", contextArtifactIds: [evidence.id, qualityAssessment.id, citationVerificationArtifactId] });
-    const synthesisText = renderSynthesis(question, included, evidenceRows, quality, contradictions, prisma);
-    const synthesis = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: synthesisText });
-
-    const reviewTask = await ctx.task({ agentId: "literature-reviewer-agent", description: "Review PRISMA synthesis", input: "Review claims, citations, evidence, and PRISMA count consistency.", contextArtifactIds: [prismaFlowArtifactId, evidence.id, synthesis.id, citationVerificationArtifactId] });
-    const reviewFindings = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "review_findings", findings: [], summary: "Automated v0 audit found no blocking findings; unresolved unverified citations remain visible in citation_verification.json.", reviewTask }, null, 2) });
-    const finalReport = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: `${synthesisText}\n\n## Artifact Index\n\n- protocol.json: ${protocol.id}\n- queries.json: ${queries.id}\n- identification.json: ${identification.id}\n- citation_chaining.json: ${citationChainArtifactId}\n- deduped_papers.json: ${dedupedArtifactId}\n- screening_log.json: ${screeningLog.id}\n- eligibility_log.json: ${eligibilityLog.id}\n- quality_assessment.json: ${qualityAssessment.id}\n- included_studies.json: ${includedStudies.id}\n- evidence_table.json: ${evidence.id}\n- contradiction_detection.json: ${contradictionArtifact.id}\n- citation_verification.json: ${citationVerificationArtifactId}\n- bibtex.bib: ${bibtexArtifactId}\n- prisma_flow.json: ${prismaFlowArtifactId}\n- review_findings.json: ${reviewFindings.id}\n` });
-
-    await ctx.recordProvenance({
-      nodes: [
-        { type: "artifact", refId: finalReport.id, label: "final_report.md" },
-        { type: "artifact", refId: synthesis.id, label: "synthesis.md" },
-        { type: "artifact", refId: evidence.id, label: "evidence_table.json" },
-        { type: "artifact", refId: prismaFlowArtifactId, label: "prisma_flow.json" },
-        ...included.map((paper) => ({ type: "source", refId: paper.id, label: paper.title, metadata: { doi: paper.doi, url: paper.url, sourceDb: paper.sourceDb } })),
-        ...evidenceRows.map((row) => ({ type: "claim", refId: row.evidenceId, label: row.claim, metadata: { paperId: row.paperId, qualityTier: row.qualityTier } }))
-      ],
-      edges: [
-        { type: "derived_from", fromRef: synthesis.id, toRef: finalReport.id },
-        { type: "derived_from", fromRef: evidence.id, toRef: synthesis.id },
-        { type: "derived_from", fromRef: prismaFlowArtifactId, toRef: finalReport.id },
-        ...evidenceRows.map((row) => ({ type: "supports", fromRef: row.paperId, toRef: row.evidenceId })),
-        ...evidenceRows.map((row) => ({ type: "supports", fromRef: row.evidenceId, toRef: synthesis.id }))
-      ]
-    });
-
-    const artifactIds = [
-      protocol.id, queries.id, ...queryTask.artifactIds, ...searchTask.artifactIds, ...searchArtifactIds,
-      identification.id, citationChainArtifactId, dedupedArtifactId, screeningLog.id, ...screeningTask.artifactIds,
-      eligibilityLog.id, ...eligibilityTask.artifactIds, qualityAssessment.id, ...qualityTask.artifactIds,
-      includedStudies.id, evidence.id, contradictionArtifact.id, citationVerificationArtifactId, bibtexArtifactId,
-      ...citationTask.artifactIds, prismaFlowArtifactId, synthesis.id, ...synthesisTask.artifactIds,
-      reviewFindings.id, ...reviewTask.artifactIds, finalReport.id
-    ];
-    return { sessionId: ctx.sessionId, status: "completed", output: `PRISMA-style literature review complete. Final report artifact: ${finalReport.id}`, artifactIds: [...new Set(artifactIds)], reviewFindingIds: [] };
+    return runLiteratureStageContract(ctx, input.input, input.metadata ?? {});
   }
 };
+
+async function runLiteratureStageContract(ctx: WorkflowContext, question: string, metadata: Record<string, unknown>) {
+  return new StageContractRunner(ctx.services).run({
+    sessionId: ctx.sessionId,
+    contractId: literatureReviewStageContract.id,
+    userGoal: question,
+    metadata
+  });
+}
+
+export const literatureReviewStageContract: StageContractDefinition = {
+  id: "literature-review-prisma-v1",
+  name: "Literature Review PRISMA Stage Contract",
+  description: "Agent-led PRISMA review contract with deterministic artifact, verifier, and provenance gates.",
+  initialStageId: "protocol_query",
+  maxStages: 12,
+  stages: [
+    {
+      id: "protocol_query",
+      goal: "Define review protocol, searchable concepts, database plan, and inclusion/exclusion criteria.",
+      agentId: "literature-query-agent",
+      allowedTools: ["artifact_write", "finalize"],
+      requiredArtifacts: [{ type: "json", stage: "protocol" }, { type: "json", stage: "queries" }],
+      verifiers: ["artifact_requirements_met", "literature_protocol_valid"],
+      retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+      gate: {
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_protocol_valid", hardGate: true }],
+        rules: [
+          { when: "hard_gate_failed", action: "retry_stage" },
+          { when: "verifier_failed", action: "retry_stage" },
+          { when: "passed", action: "next" }
+        ]
+      },
+      next: [{ when: "passed", stageId: "search_dedupe" }],
+      run: async (ctx) => {
+        const agentProtocol = await readStageArtifact(ctx.services, ctx.artifactIds, "protocol");
+        const agentQueries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
+        if (agentProtocol && agentQueries) {
+          const dbs = Array.isArray(agentProtocol.databases) && agentProtocol.databases.length ? agentProtocol.databases.map(String) : selectedQueryDbs(agentQueries);
+          return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria() } };
+        }
+        const limit = Number(ctx.metadata.limit ?? 25);
+        const dbs = Array.isArray(ctx.metadata.dbs) && ctx.metadata.dbs.length ? ctx.metadata.dbs.map(String) : ["openalex", "semantic-scholar", "crossref"];
+        const criteria = defaultCriteria();
+        const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
+        const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "queries", researchQuestion: ctx.input, concepts: inferConcepts(ctx.input), criteria, selectedQueries: dbs.map((db) => ({ database: db, query: ctx.input, rationale: "Primary selected query for this stage contract." })), alternativeQueries: dbs.map((db) => ({ database: db, query: `${ctx.input} systematic review`, rationale: "Fallback recall-expansion query." })) }, null, 2) });
+        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
+      }
+    },
+    {
+      id: "search_dedupe",
+      goal: "Search selected scholarly databases, preserve source errors, collect citation-chain hints, and deduplicate records.",
+      agentId: "literature-search-agent",
+      allowedTools: ["science_search", "citation_chain", "paper_deduplicate", "artifact_write", "finalize"],
+      requiredArtifacts: [{ type: "json", stage: "identification" }, { type: "json", stage: "deduplication" }],
+      verifiers: ["artifact_requirements_met", "literature_search_valid"],
+      retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+      gate: {
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_search_valid", hardGate: true }],
+        rules: [
+          { when: "verifier_failed:search_invalid", action: "go_to_stage", stageId: "protocol_query" },
+          { when: "hard_gate_failed", action: "retry_stage" },
+          { when: "verifier_failed", action: "retry_stage" },
+          { when: "passed", action: "next" }
+        ]
+      },
+      next: [{ when: "passed", stageId: "screening" }],
+      run: async (ctx) => {
+        const agentIdentification = await readStageArtifact(ctx.services, ctx.artifactIds, "identification");
+        const agentDedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
+        if (agentIdentification && agentDedupe) {
+          const deduped = (agentDedupe.deduped ?? agentDedupe.papers ?? []) as PaperHit[];
+          return { statePatch: { allPapers: deduped, searchCounts: agentIdentification.searchCounts ?? {}, sourceErrors: agentIdentification.sourceErrors ?? [], deduped, duplicates: agentDedupe.duplicates ?? [] } };
+        }
+        const dbs = (ctx.state.dbs as string[]) ?? ["openalex"];
+        const limit = Number(ctx.state.limit ?? 25);
+        const allPapers: PaperHit[] = [];
+        const searchArtifactIds: string[] = [];
+        const searchCounts: Record<string, number> = {};
+        const sourceErrors: any[] = [];
+        for (const db of dbs) {
+          const result = await ctx.tool({ toolId: "science_search", input: { db, query: ctx.input, limit } });
+          const out = result.output as any;
+          allPapers.push(...(out.results ?? []));
+          searchCounts[db] = out.count ?? 0;
+          if (out.error) sourceErrors.push({ db, error: out.error });
+          if (out.artifactId) searchArtifactIds.push(out.artifactId);
+        }
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining: 0 }, null, 2) });
+        const chain = await ctx.tool({ toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
+        const citationChainArtifactId = (chain.output as any).artifactId as string;
+        const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
+        const deduped = (dedupe.output as any).papers as PaperHit[];
+        const duplicates = (dedupe.output as any).duplicates ?? [];
+        const dedupedArtifactId = (dedupe.output as any).artifactId as string;
+        return { artifactIds: [...searchArtifactIds, identification.id, citationChainArtifactId, dedupedArtifactId], statePatch: { allPapers, searchCounts, sourceErrors, deduped, duplicates, identificationArtifactId: identification.id, citationChainArtifactId, dedupedArtifactId } };
+      }
+    },
+    {
+      id: "screening",
+      goal: "Screen titles and abstracts using explicit inclusion/exclusion criteria and record a reason for every paper.",
+      agentId: "literature-screening-agent",
+      allowedTools: ["artifact_read", "artifact_write", "finalize"],
+      requiredArtifacts: [{ type: "json", stage: "screening_log" }],
+      verifiers: ["artifact_requirements_met", "literature_screening_complete"],
+      retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+      gate: {
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_screening_complete", hardGate: true }],
+        semantic: { agentId: "literature-reviewer-agent", mode: "always" },
+        rules: [
+          { when: "hard_gate_failed", action: "retry_stage" },
+          { when: "review_blocking:topic_drift", action: "go_to_stage", stageId: "protocol_query" },
+          { when: "review_blocking", action: "retry_stage" },
+          { when: "review_major", action: "retry_stage" },
+          { when: "passed", action: "next" }
+        ]
+      },
+      next: [{ when: "passed", stageId: "eligibility_quality" }],
+      run: async (ctx) => {
+        const deduped = (ctx.state.deduped as PaperHit[]) ?? [];
+        const agentScreening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
+        if (agentScreening?.decisions) {
+          const screeningDecisions = agentScreening.decisions;
+          const screenedIn = screeningDecisions.filter((d: any) => d.decision === "include").map((d: any) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
+          return { statePatch: { screeningDecisions, screenedIn } };
+        }
+        const criteria = ctx.state.criteria ?? defaultCriteria();
+        const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper));
+        const screenedIn = screeningDecisions.filter((d) => d.decision === "include").map((d) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
+        const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, decisions: screeningDecisions }, null, 2) });
+        return { artifactIds: [screeningLog.id], statePatch: { screeningDecisions, screenedIn, screeningLogArtifactId: screeningLog.id } };
+      }
+    },
+    {
+      id: "eligibility_quality",
+      goal: "Assess eligibility, assign evidence quality tiers, and extract structured evidence rows.",
+      agentId: "literature-eligibility-agent",
+      allowedTools: ["artifact_read", "artifact_write", "evidence_table_write", "finalize"],
+      requiredArtifacts: [{ type: "json", stage: "eligibility_log" }, { type: "json", stage: "quality_assessment" }, { type: "json", stage: "included_studies" }, { type: "json", stage: "evidence_table" }],
+      verifiers: ["artifact_requirements_met", "literature_evidence_complete"],
+      retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+      gate: {
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_evidence_complete", hardGate: true }],
+        semantic: { agentId: "literature-reviewer-agent", mode: "always" },
+        rules: [
+          { when: "hard_gate_failed", action: "retry_stage" },
+          { when: "review_blocking:topic_drift", action: "go_to_stage", stageId: "screening" },
+          { when: "review_blocking", action: "retry_stage" },
+          { when: "review_major", action: "retry_stage" },
+          { when: "passed", action: "next" }
+        ]
+      },
+      next: [{ when: "passed", stageId: "citation_synthesis_review" }],
+      run: async (ctx) => {
+        const screenedIn = (ctx.state.screenedIn as PaperHit[]) ?? [];
+        const agentEligibility = await readStageArtifact(ctx.services, ctx.artifactIds, "eligibility_log");
+        const agentQuality = await readStageArtifact(ctx.services, ctx.artifactIds, "quality_assessment");
+        const agentIncluded = await readStageArtifact(ctx.services, ctx.artifactIds, "included_studies");
+        const agentEvidence = await readStageArtifact(ctx.services, ctx.artifactIds, "evidence_table");
+        if (agentEligibility && agentQuality && agentIncluded && agentEvidence) {
+          const included = (agentIncluded.papers ?? []) as PaperHit[];
+          const quality = agentQuality.tiers ?? [];
+          const evidenceRows = agentEvidence.rows ?? [];
+          return { statePatch: { eligibilityDecisions: agentEligibility.decisions ?? [], included, quality, evidenceRows, contradictions: [] } };
+        }
+        const limit = Number(ctx.state.limit ?? 25);
+        const eligibilityDecisions = screenedIn.map((paper) => assessEligibility(paper));
+        const included = eligibilityDecisions.filter((d) => d.decision === "include").map((d) => screenedIn.find((p) => p.id === d.paperId)!).filter(Boolean).slice(0, Math.min(25, limit));
+        const eligibilityLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "eligibility_log", decisions: eligibilityDecisions }, null, 2) });
+        const quality = included.map((paper) => assessQuality(paper));
+        const qualityAssessment = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "quality_assessment", tiers: quality }, null, 2) });
+        const includedStudies = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "included_studies", papers: included }, null, 2) });
+        const evidenceRows = included.map((paper, index) => ({
+          evidenceId: `ev_${index + 1}`,
+          paperId: paper.id,
+          claim: `${paper.title} provides ${paper.abstract ? "abstract-level" : "metadata-level"} evidence relevant to "${ctx.input}".`,
+          supportType: "context",
+          quoteOrSummary: paper.abstract?.slice(0, 700) || `${paper.title} (${paper.year ?? "n.d."})`,
+          qualityTier: quality.find((q) => q.paperId === paper.id)?.tier ?? "Tier 3",
+          confidence: paper.abstract ? 0.72 : 0.52
+        }));
+        const evidence = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "evidence_table", researchQuestion: ctx.input, rows: evidenceRows }, null, 2) });
+        const contradictions = detectContradictions(evidenceRows);
+        const contradictionArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "contradiction_detection", contradictions }, null, 2) });
+        return { artifactIds: [eligibilityLog.id, qualityAssessment.id, includedStudies.id, evidence.id, contradictionArtifact.id], statePatch: { eligibilityDecisions, included, quality, evidenceRows, contradictions, eligibilityLogArtifactId: eligibilityLog.id, qualityAssessmentArtifactId: qualityAssessment.id, includedStudiesArtifactId: includedStudies.id, evidenceArtifactId: evidence.id, contradictionArtifactId: contradictionArtifact.id } };
+      }
+    },
+    {
+      id: "citation_synthesis_review",
+      goal: "Verify citations, write BibTeX, produce PRISMA flow, synthesize the report, and run final semantic review.",
+      agentId: "literature-synthesis-agent",
+      allowedTools: ["citation_verify", "bibtex_write", "prisma_flow_write", "artifact_read", "artifact_write", "finalize"],
+      requiredArtifacts: [{ type: "json", stage: "citation_verification" }, { type: "json", stage: "prisma_flow" }, { type: "markdown", minCount: 2 }],
+      verifiers: ["artifact_requirements_met", "literature_prisma_counts_valid", "no_open_blocking_findings"],
+      review: { agentId: "literature-reviewer-agent", mode: "always" },
+      retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+      gate: {
+        deterministic: [
+          { id: "artifact_requirements_met", hardGate: true },
+          { id: "literature_prisma_counts_valid", hardGate: true },
+          { id: "no_open_blocking_findings", hardGate: true }
+        ],
+        semantic: { agentId: "literature-reviewer-agent", mode: "always" },
+        rules: [
+          { when: "hard_gate_failed", action: "retry_stage" },
+          { when: "review_blocking:citation_mismatch", action: "retry_stage" },
+          { when: "review_blocking:topic_drift", action: "go_to_stage", stageId: "screening" },
+          { when: "review_blocking", action: "retry_stage" },
+          { when: "review_major", action: "retry_stage" },
+          { when: "passed", action: "next" }
+        ]
+      },
+      run: async (ctx) => {
+        const agentCitation = await readStageArtifact(ctx.services, ctx.artifactIds, "citation_verification");
+        const agentPrisma = await readStageArtifact(ctx.services, ctx.artifactIds, "prisma_flow");
+        const agentMarkdown = await listArtifactsByType(ctx.services, ctx.artifactIds, "markdown");
+        if (agentCitation && agentPrisma && agentMarkdown.length >= 2) {
+          return { output: `PRISMA-style literature review complete. Final report artifact: ${agentMarkdown.at(-1)?.id}`, statePatch: { prisma: agentPrisma, citationVerification: agentCitation, finalReportArtifactId: agentMarkdown.at(-1)?.id } };
+        }
+        const allPapers = (ctx.state.allPapers as PaperHit[]) ?? [];
+        const deduped = (ctx.state.deduped as PaperHit[]) ?? [];
+        const duplicates = (ctx.state.duplicates as any[]) ?? [];
+        const screeningDecisions = (ctx.state.screeningDecisions as any[]) ?? [];
+        const screenedIn = (ctx.state.screenedIn as PaperHit[]) ?? [];
+        const eligibilityDecisions = (ctx.state.eligibilityDecisions as any[]) ?? [];
+        const included = (ctx.state.included as PaperHit[]) ?? [];
+        const quality = (ctx.state.quality as any[]) ?? [];
+        const evidenceRows = (ctx.state.evidenceRows as any[]) ?? [];
+        const contradictions = (ctx.state.contradictions as any[]) ?? [];
+        const citationVerification = await ctx.tool({ toolId: "citation_verify", input: { papers: included } });
+        const citationVerificationArtifactId = (citationVerification.output as any).artifactId as string;
+        const bibtex = await ctx.tool({ toolId: "bibtex_write", input: { papers: included } });
+        const bibtexArtifactId = (bibtex.output as any).artifactId as string;
+        const prisma = {
+          recordsIdentifiedThroughDatabaseSearching: allPapers.length,
+          recordsIdentifiedThroughCitationChaining: 0,
+          totalRecordsIdentified: allPapers.length,
+          duplicateRecordsRemoved: duplicates.length,
+          recordsAfterDeduplication: deduped.length,
+          recordsScreened: deduped.length,
+          recordsExcludedTitleAbstract: screeningDecisions.filter((d) => d.decision === "exclude").length,
+          fullTextOrAbstractRecordsAssessed: screenedIn.length,
+          recordsExcludedEligibility: eligibilityDecisions.filter((d) => d.decision === "exclude").length,
+          studiesIncludedInSynthesis: included.length,
+          tierCounts: countTiers(quality)
+        };
+        const prismaFlow = await ctx.tool({ toolId: "prisma_flow_write", input: prisma });
+        const prismaFlowArtifactId = (prismaFlow.output as any).artifactId as string;
+        const synthesisText = renderSynthesis(ctx.input, included, evidenceRows, quality, contradictions, prisma);
+        const synthesis = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: synthesisText });
+        const reviewFindings = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "review_findings", findings: [], summary: "Stage contract ran deterministic verifiers and final semantic reviewer; unresolved unverified citations remain visible in citation_verification.json." }, null, 2) });
+        const finalReport = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: `${synthesisText}\n\n## Artifact Index\n\n- protocol.json: ${ctx.state.protocolArtifactId}\n- queries.json: ${ctx.state.queriesArtifactId}\n- identification.json: ${ctx.state.identificationArtifactId}\n- citation_chaining.json: ${ctx.state.citationChainArtifactId}\n- deduped_papers.json: ${ctx.state.dedupedArtifactId}\n- screening_log.json: ${ctx.state.screeningLogArtifactId}\n- eligibility_log.json: ${ctx.state.eligibilityLogArtifactId}\n- quality_assessment.json: ${ctx.state.qualityAssessmentArtifactId}\n- included_studies.json: ${ctx.state.includedStudiesArtifactId}\n- evidence_table.json: ${ctx.state.evidenceArtifactId}\n- contradiction_detection.json: ${ctx.state.contradictionArtifactId}\n- citation_verification.json: ${citationVerificationArtifactId}\n- bibtex.bib: ${bibtexArtifactId}\n- prisma_flow.json: ${prismaFlowArtifactId}\n- review_findings.json: ${reviewFindings.id}\n` });
+        await ctx.recordProvenance({
+          nodes: [
+            { type: "artifact", refId: finalReport.id, label: "final_report.md" },
+            { type: "artifact", refId: synthesis.id, label: "synthesis.md" },
+            { type: "artifact", refId: String(ctx.state.evidenceArtifactId), label: "evidence_table.json" },
+            { type: "artifact", refId: prismaFlowArtifactId, label: "prisma_flow.json" },
+            ...included.map((paper) => ({ type: "source", refId: paper.id, label: paper.title, metadata: { doi: paper.doi, url: paper.url, sourceDb: paper.sourceDb } })),
+            ...evidenceRows.map((row) => ({ type: "claim", refId: row.evidenceId, label: row.claim, metadata: { paperId: row.paperId, qualityTier: row.qualityTier } }))
+          ],
+          edges: [
+            { type: "derived_from", fromRef: synthesis.id, toRef: finalReport.id },
+            { type: "derived_from", fromRef: String(ctx.state.evidenceArtifactId), toRef: synthesis.id },
+            { type: "derived_from", fromRef: prismaFlowArtifactId, toRef: finalReport.id },
+            ...evidenceRows.map((row) => ({ type: "supports", fromRef: row.paperId, toRef: row.evidenceId })),
+            ...evidenceRows.map((row) => ({ type: "supports", fromRef: row.evidenceId, toRef: synthesis.id }))
+          ]
+        });
+        return { output: `PRISMA-style literature review complete. Final report artifact: ${finalReport.id}`, artifactIds: [citationVerificationArtifactId, bibtexArtifactId, prismaFlowArtifactId, synthesis.id, reviewFindings.id, finalReport.id], statePatch: { prisma, citationVerificationArtifactId, bibtexArtifactId, prismaFlowArtifactId, synthesisArtifactId: synthesis.id, reviewFindingsArtifactId: reviewFindings.id, finalReportArtifactId: finalReport.id } };
+      }
+    }
+  ]
+};
+
+function defaultCriteria() {
+  return {
+    inclusion: [
+      "IC1: directly addresses the research question",
+      "IC2: contains empirical results, theoretical analysis, or systematic review",
+      "IC3: has identifiable scholarly metadata"
+    ],
+    exclusion: [
+      "EC1: only tangentially mentions the topic",
+      "EC2: insufficient metadata to verify source identity",
+      "EC3: duplicate or superseded record",
+      "EC4: unavailable abstract/summary and low relevance"
+    ]
+  };
+}
+
+const literatureStageVerifiers: StageVerifierDefinition[] = [
+  {
+    id: "literature_protocol_valid",
+    description: "Validate literature protocol and query-plan artifacts.",
+    async verify(ctx) {
+      const protocol = await readStageArtifact(ctx.services, ctx.artifactIds, "protocol");
+      const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
+      const ok = Boolean(protocol?.question && Array.isArray(protocol.databases) && protocol.databases.length && Array.isArray(queries?.selectedQueries) && queries.selectedQueries.length);
+      return ok ? { ok: true, message: "Protocol and query plan are valid." } : { ok: false, message: "Protocol or query plan is missing required question/database/query fields.", severity: "major", category: "protocol_invalid" };
+    }
+  },
+  {
+    id: "literature_search_valid",
+    description: "Validate search and deduplication outputs.",
+    async verify(ctx) {
+      const identification = await readStageArtifact(ctx.services, ctx.artifactIds, "identification");
+      const dedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
+      const records = Number(identification?.recordsIdentifiedThroughDatabaseSearching ?? -1);
+      const after = Number(dedupe?.recordsAfter ?? -1);
+      const ok = records >= 0 && after >= 0 && after <= records;
+      return ok ? { ok: true, message: "Search and deduplication outputs are count-consistent." } : { ok: false, message: "Search/deduplication counts are missing or inconsistent.", severity: "major", category: "search_invalid" };
+    }
+  },
+  {
+    id: "literature_screening_complete",
+    description: "Validate that every deduplicated record has a screening decision and reason.",
+    async verify(ctx) {
+      const dedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
+      const screening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
+      const papers = dedupe?.deduped ?? [];
+      const decisions = screening?.decisions ?? [];
+      const complete = Array.isArray(papers) && Array.isArray(decisions) && decisions.length === papers.length && decisions.every((d: any) => d.paperId && ["include", "exclude", "uncertain"].includes(d.decision) && d.reason);
+      return complete ? { ok: true, message: "Screening decisions are complete." } : { ok: false, message: "Screening log does not contain a valid decision and reason for every deduplicated record.", severity: "major", category: "screening_incomplete" };
+    }
+  },
+  {
+    id: "literature_evidence_complete",
+    description: "Validate included studies, quality tiers, and evidence rows.",
+    async verify(ctx) {
+      const included = await readStageArtifact(ctx.services, ctx.artifactIds, "included_studies");
+      const quality = await readStageArtifact(ctx.services, ctx.artifactIds, "quality_assessment");
+      const evidence = await readStageArtifact(ctx.services, ctx.artifactIds, "evidence_table");
+      const papers = included?.papers ?? [];
+      const tiers = quality?.tiers ?? [];
+      const rows = evidence?.rows ?? [];
+      const paperIds = new Set(papers.map((p: PaperHit) => p.id));
+      const ok = Array.isArray(papers) && Array.isArray(tiers) && Array.isArray(rows) && tiers.every((q: any) => q.paperId && q.tier) && rows.every((r: any) => r.evidenceId && paperIds.has(r.paperId) && r.claim);
+      return ok ? { ok: true, message: "Evidence artifacts are internally consistent." } : { ok: false, message: "Evidence table, included studies, or quality tiers are incomplete or inconsistent.", severity: "major", category: "evidence_incomplete" };
+    }
+  },
+  {
+    id: "literature_prisma_counts_valid",
+    description: "Validate PRISMA flow arithmetic.",
+    async verify(ctx) {
+      const prisma = await readStageArtifact(ctx.services, ctx.artifactIds, "prisma_flow");
+      if (!prisma) return { ok: false, message: "PRISMA flow artifact is missing.", severity: "major", category: "prisma_missing" };
+      const total = Number(prisma.recordsIdentifiedThroughDatabaseSearching ?? 0) + Number(prisma.recordsIdentifiedThroughCitationChaining ?? 0);
+      const after = Number(prisma.recordsAfterDeduplication ?? 0);
+      const duplicates = Number(prisma.duplicateRecordsRemoved ?? 0);
+      const screened = Number(prisma.recordsScreened ?? -1);
+      const included = Number(prisma.studiesIncludedInSynthesis ?? -1);
+      const ok = Number(prisma.totalRecordsIdentified) === total && after + duplicates === total && screened === after && included >= 0 && included <= screened;
+      return ok ? { ok: true, message: "PRISMA counts are valid." } : { ok: false, message: "PRISMA counts are arithmetically inconsistent.", severity: "major", category: "prisma_count_mismatch" };
+    }
+  }
+];
+
+async function readStageArtifact(services: RuntimeServices, artifactIds: string[], stage: string): Promise<any | null> {
+  for (const id of artifactIds) {
+    const artifact = await services.artifactStore.get(id);
+    if (!artifact || artifact.mediaType !== "application/json") continue;
+    try {
+      const parsed = JSON.parse((await services.artifactStore.read(id)).toString("utf8"));
+      if (parsed?.stage === stage) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function selectedQueryDbs(queries: any): string[] {
+  const selected = Array.isArray(queries?.selectedQueries) ? queries.selectedQueries : [];
+  return selected.map((q: any) => q.database).filter((db: unknown): db is string => typeof db === "string" && db.length > 0);
+}
+
+async function listArtifactsByType(services: RuntimeServices, artifactIds: string[], type: string): Promise<Artifact[]> {
+  const out: Artifact[] = [];
+  for (const id of artifactIds) {
+    const artifact = await services.artifactStore.get(id);
+    if (artifact?.type === type) out.push(artifact);
+  }
+  return out;
+}
 
 function inferConcepts(question: string): any[] {
   return question.split(/\s+/).filter((w) => w.length > 3).slice(0, 10).map((name) => ({ name, synonyms: [], required: false }));
@@ -719,14 +975,18 @@ function renderSynthesis(question: string, papers: PaperHit[], rows: any[], qual
 export const literaturePack: CapabilityPack = {
   id: "literature",
   name: "Literature Research Pack",
-  version: "0.2.0",
+  version: "0.3.0",
   description: "PRISMA-style literature review workflows and scholarly database connectors.",
   agents,
   tools: [scienceListDbsTool, scienceSearchTool, paperFetchTool, paperDeduplicateTool, citationChainTool, citationVerifyTool, bibtexWriteTool, prismaFlowWriteTool, evidenceTableWriteTool, citationCheckTool],
   reviewers: [],
   workflows: [literatureReviewWorkflow],
+  stageContracts: [literatureReviewStageContract],
   activate(services) {
     getLiteratureConnectorRegistry(services);
+    for (const verifier of literatureStageVerifiers) {
+      if (!services.verifierRegistry.get(verifier.id)) services.verifierRegistry.register(verifier);
+    }
   }
 };
 
