@@ -241,7 +241,21 @@ test("literature PRISMA separates citation-chain hints from screened records", a
         };
       }
     });
-    const result = await runtime.run({ input: "AI4S materials discovery trends", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-chain-review"], limit: 1 } });
+    const result = await runtime.run({
+      input: "AI4S materials discovery trends",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-chain-review"],
+        limit: 1,
+        topicProfile: {
+          topicLabel: "AI4S",
+          coreTerms: ["AI4S", "AI for Science", "scientific discovery"],
+          domainTerms: ["materials discovery", "autonomous laboratories"],
+          modifierTerms: ["trends", "review"]
+        }
+      }
+    });
     assert.equal(result.status, "completed");
     const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
     const parsed = artifacts.map((artifact) => {
@@ -337,9 +351,9 @@ test("literature database normalization keeps only executable connector ids", as
 });
 
 test("arXiv query profile converts broad boolean queries into short fielded terms", () => {
-  const query = toArxivSearchQuery('("AI for Science" OR "Artificial Intelligence for Science" OR "AI4S" OR "AI-driven scientific discovery" OR "scientific machine learning") AND (review OR survey OR roadmap OR trend)');
-  assert.equal(query, 'all:"AI for Science" OR all:"Artificial Intelligence for Science" OR all:"AI4S"');
-  assert.ok(query.length < 100);
+  const query = toArxivSearchQuery('("protein design" OR "molecular generation" OR "structure prediction") AND (review OR survey OR roadmap OR trend)');
+  assert.equal(query, 'all:"protein design" OR all:"molecular generation" OR all:"structure prediction"');
+  assert.ok(query.length < 120);
 });
 
 test("literature search scaffold retries retryable source errors with fallback queries", async () => {
@@ -360,7 +374,21 @@ test("literature search scaffold retries retryable source errors with fallback q
         ];
       }
     });
-    const result = await runtime.run({ input: "AI4S的发展现状和趋势", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-fallback"], limit: 1 } });
+    const result = await runtime.run({
+      input: "AI4S的发展现状和趋势",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-fallback"],
+        limit: 1,
+        topicProfile: {
+          topicLabel: "AI4S",
+          coreTerms: ["AI4S", "AI for Science", "scientific machine learning"],
+          domainTerms: ["scientific discovery"],
+          modifierTerms: ["现状", "趋势"]
+        }
+      }
+    });
     assert.equal(result.status, "completed");
     assert.ok(calls >= 2);
     const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
@@ -414,7 +442,21 @@ test("literature pack registers and runs a stage contract", async () => {
         ];
       }
     });
-    const result = await runtime.run({ input: "AI4S literature agents", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-stage"], limit: 1 } });
+    const result = await runtime.run({
+      input: "AI4S literature agents",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-stage"],
+        limit: 1,
+        topicProfile: {
+          topicLabel: "AI4S literature agents",
+          coreTerms: ["AI4S", "literature agents", "stage contracts"],
+          domainTerms: ["stage contracts", "verifiers", "evidence", "citation checks"],
+          modifierTerms: ["review"]
+        }
+      }
+    });
     assert.equal(result.status, "completed");
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.started" && event.stageId === "protocol_query"));
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.completed" && event.stageId === "citation_synthesis_review"));
@@ -448,7 +490,21 @@ test("AI4S literature screening excludes modifier-only trend papers", async () =
         ];
       }
     });
-    const result = await runtime.run({ input: "AI4S的发展现状和趋势", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-ai4s-quality"], limit: 2 } });
+    const result = await runtime.run({
+      input: "AI4S的发展现状和趋势",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-ai4s-quality"],
+        limit: 2,
+        topicProfile: {
+          topicLabel: "AI4S",
+          coreTerms: ["AI4S", "AI for Science", "AI-driven scientific discovery"],
+          domainTerms: ["foundation models", "autonomous laboratories", "scientific discovery"],
+          modifierTerms: ["现状", "趋势", "发展"]
+        }
+      }
+    });
     assert.equal(result.status, "completed");
     const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
     const screening = artifacts.map((artifact) => {

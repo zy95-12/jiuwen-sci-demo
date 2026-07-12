@@ -863,16 +863,16 @@ export const literatureReviewStageContract: StageContractDefinition = {
           const agentDbs = normalizeLiteratureDatabaseIds(agentProtocol.databases, registry);
           const queryDbs = normalizeLiteratureDatabaseIds(selectedQueryDbs(agentQueries), registry);
           const dbs = metadataDbs.length ? metadataDbs : agentDbs.length ? agentDbs : queryDbs.length ? queryDbs : ["openalex"];
-          const topicProfile = topicProfileFromQueries(agentQueries);
+          const topicProfile = topicProfileFromQueries(agentQueries, ctx.input, ctx.metadata.topicProfile);
           return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile } };
         }
         const limit = Number(ctx.metadata.limit ?? 25);
         const dbs = metadataDbs.length ? metadataDbs : ["openalex", "semantic-scholar", "crossref"];
         const criteria = defaultCriteria();
-        const queryPlan = buildQueryPlan(ctx.input, dbs, criteria);
+        const queryPlan = buildQueryPlan(ctx.input, dbs, criteria, ctx.metadata.topicProfile);
         const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
         const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(queryPlan, null, 2) });
-        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan), protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
+        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan, ctx.input, ctx.metadata.topicProfile), protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
       }
     },
     {
@@ -915,7 +915,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         }));
         for (const db of dbs) {
           const querySpec = selectedQueries.find((q: any) => q.database === db);
-          const queries = uniqueQueries([querySpec?.query ?? ctx.input, ...(querySpec?.fallbackQueries ?? []), ...dbFallbackQueries(db, ctx.input)]);
+          const queries = uniqueQueries([querySpec?.query ?? ctx.input, ...(querySpec?.fallbackQueries ?? []), ...dbFallbackQueries(db, ctx.input, ctx.state.topicProfile as TopicProfile | undefined)]);
           const { out, artifactIds, errors } = await searchWithFallback(ctx, db, queries, limit);
           allPapers.push(...(out.results ?? []));
           searchCounts[db] = out.count ?? 0;
@@ -967,7 +967,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
           return { statePatch: { screeningDecisions, screenedIn } };
         }
         const criteria = ctx.state.criteria ?? defaultCriteria();
-        const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan);
+        const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan, ctx.input, ctx.metadata.topicProfile);
         const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper, topicProfile));
         const screenedIn = screeningDecisions.filter((d) => d.decision === "include").map((d) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
         const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, decisions: screeningDecisions }, null, 2) });
@@ -1158,11 +1158,11 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       const conceptTerms = Array.isArray(queries?.concepts) ? queries.concepts.flatMap((concept: any) => [concept.name, concept.label, ...(concept.synonyms ?? [])]).filter(Boolean) : [];
       const hasDefinition = Boolean(queries?.conceptDefinition?.definition || queries?.concept_definition?.definition || conceptTerms.length);
       const hasCore = coreTerms.length >= 3 || termsOf(conceptTerms).length >= 3;
-      const hasExpandedEnglish = selectedQueries.some((q: any) => /AI for Science|Artificial Intelligence for Science|scientific discovery|foundation models for science/i.test(String(q.query ?? "")));
+      const hasUsableQuery = selectedQueries.some((q: any) => String(q.query ?? "").trim().length >= 3);
       const rawQuestion = getQuestion(queries);
       const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(rawQuestion ?? "")));
-      const ok = hasDefinition && hasCore && hasExpandedEnglish && notOnlyRawQuestion;
-      return ok ? { ok: true, message: "Query concept grounding and expansion are valid." } : { ok: false, message: "Query plan lacks concept grounding, AI4S core terms, or expanded English scholarly queries.", severity: "blocking", category: "query_concepts_invalid" };
+      const ok = hasDefinition && hasCore && hasUsableQuery && notOnlyRawQuestion;
+      return ok ? { ok: true, message: "Query concept grounding and expansion are valid." } : { ok: false, message: "Query plan lacks concept grounding or expanded scholarly queries.", severity: "blocking", category: "query_concepts_invalid" };
     }
   },
   {
@@ -1191,7 +1191,7 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
   },
   {
     id: "literature_screening_topic_anchor_valid",
-    description: "Validate that included studies match AI4S core topic anchors, not only trend modifiers.",
+    description: "Validate that included studies match topic anchors, not only trend modifiers.",
     async verify(ctx) {
       const dedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
       const screening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
@@ -1206,7 +1206,7 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       });
       return weak.length === 0
         ? { ok: true, message: "Included studies have topic anchors." }
-        : { ok: false, message: `Included studies without AI4S topic anchors: ${weak.map((d: any) => d.title ?? d.paperId).join("; ")}`, severity: "blocking", category: "topic_anchor_failed" };
+        : { ok: false, message: `Included studies without topic anchors: ${weak.map((d: any) => d.title ?? d.paperId).join("; ")}`, severity: "blocking", category: "topic_anchor_failed" };
     }
   },
   {
@@ -1362,76 +1362,62 @@ function uniqueQueries(queries: any[]): string[] {
 }
 
 type TopicProfile = {
+  topicLabel?: string;
   coreTerms: string[];
   domainTerms: string[];
   modifierTerms: string[];
 };
 
-function buildQueryPlan(question: string, dbs: string[], criteria: unknown): any {
-  const ai4s = defaultAi4sTopicProfile();
-  const broadQuery = '("AI for Science" OR "Artificial Intelligence for Science" OR "AI4S" OR "AI-driven scientific discovery" OR "scientific machine learning")';
+function buildQueryPlan(question: string, dbs: string[], criteria: unknown, metadataProfile?: unknown): any {
+  const topicProfile = topicProfileFromMetadata(metadataProfile, question);
+  const broadQuery = booleanOr(topicProfile.coreTerms);
   const trendQuery = `${broadQuery} AND (review OR survey OR roadmap OR trend OR "current status" OR "future directions")`;
-  const domainQuery = '("foundation models for science" OR "autonomous laboratory" OR "materials discovery" OR "drug discovery" OR "protein design" OR "climate modeling" OR "physics-informed neural networks")';
+  const domainQuery = booleanOr(topicProfile.domainTerms);
   return {
     stage: "queries",
     researchQuestion: question,
     conceptDefinition: {
-      term: "AI4S",
-      definition: "AI4S refers to using artificial intelligence methods to accelerate scientific discovery, modeling, experimentation, and engineering across scientific domains.",
-      scope: ["AI-driven scientific discovery", "scientific machine learning", "foundation models for science", "autonomous laboratories", "domain discovery tasks such as materials, drug, protein, climate, and physics modeling"]
+      term: topicProfile.topicLabel ?? question,
+      definition: "Review scope derived from the user question and optional runtime topic profile.",
+      scope: [...topicProfile.coreTerms, ...topicProfile.domainTerms]
     },
-    concepts: inferConcepts(question),
-    coreTerms: ai4s.coreTerms,
-    domainTerms: ai4s.domainTerms,
-    modifierTerms: ai4s.modifierTerms,
+    concepts: inferConcepts(question, topicProfile),
+    coreTerms: topicProfile.coreTerms,
+    domainTerms: topicProfile.domainTerms,
+    modifierTerms: topicProfile.modifierTerms,
     criteria,
-    selectedQueries: dbs.map((db) => databaseSearchQuery(db, trendQuery, domainQuery)),
+    selectedQueries: dbs.map((db) => databaseSearchQuery(db, trendQuery, domainQuery, topicProfile)),
     alternativeQueries: dbs.flatMap((db) => [
-      { database: db, query: broadQuery, rationale: "High-precision AI4S core concept query." },
-      { database: db, query: domainQuery, rationale: "Domain-expansion query for AI4S application areas." }
+      { database: db, query: broadQuery, rationale: "High-precision core concept query." },
+      { database: db, query: domainQuery, rationale: "Domain-expansion query from the runtime topic profile." }
     ])
   };
 }
 
-function databaseSearchQuery(db: string, trendQuery: string, domainQuery: string): any {
+function databaseSearchQuery(db: string, trendQuery: string, domainQuery: string, topicProfile: TopicProfile): any {
+  const fallbackQueries = dbFallbackQueries(db, topicProfile.topicLabel ?? "", topicProfile);
   if (db === "arxiv") {
     return {
       database: db,
-      query: '"AI for Science" OR "scientific machine learning"',
-      fallbackQueries: [
-        '"physics-informed neural networks"',
-        '"machine learning" "scientific discovery"',
-        '"foundation models" science'
-      ],
+      query: booleanOr(topicProfile.coreTerms.slice(0, 2)),
+      fallbackQueries,
       rationale: "arXiv API is more reliable with short technical queries; use fallback queries for recall instead of one long Boolean expression."
     };
   }
   return {
     database: db,
-    query: `${trendQuery} OR ${domainQuery}`,
-    fallbackQueries: dbFallbackQueries(db),
-    rationale: "Expanded AI4S query with core concept anchors, domain applications, and trend/review modifiers."
+    query: domainQuery ? `${trendQuery} OR ${domainQuery}` : trendQuery,
+    fallbackQueries,
+    rationale: "Expanded query with core concept anchors, domain terms, and trend/review modifiers."
   };
 }
 
-function dbFallbackQueries(db: string, question = ""): string[] {
-  if (db === "arxiv") {
-    return [
-      '"AI for Science"',
-      '"scientific machine learning"',
-      '"physics-informed neural networks"',
-      '"machine learning" "materials discovery"',
-      '"machine learning" "drug discovery"'
-    ];
-  }
-  if (/AI4S|AI for Science|发展现状|趋势/i.test(question)) {
-    return [
-      '"AI for Science"',
-      '"scientific machine learning"',
-      '"AI-driven scientific discovery"'
-    ];
-  }
-  return [];
+function dbFallbackQueries(db: string, question = "", profile?: TopicProfile): string[] {
+  const topicProfile = profile ?? topicProfileFromMetadata(undefined, question);
+  const seeds = db === "arxiv"
+    ? [...topicProfile.coreTerms.slice(0, 3), ...topicProfile.domainTerms.slice(0, 2)]
+    : topicProfile.coreTerms.slice(0, 3);
+  return uniqueQueries(seeds.map(quoteQueryTerm));
 }
 
 export function toArxivSearchQuery(query: string): string {
@@ -1442,70 +1428,30 @@ export function toArxivSearchQuery(query: string): string {
 
 function arxivTerms(query: string): string[] {
   const quoted = [...query.matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter(Boolean);
-  const known = [
-    "AI for Science",
-    "scientific machine learning",
-    "physics-informed neural networks",
-    "foundation models",
-    "machine learning",
-    "scientific discovery",
-    "materials discovery",
-    "drug discovery",
-    "protein design",
-    "climate modeling"
-  ].filter((term) => query.toLowerCase().includes(term.toLowerCase()));
-  const fallback = quoted.length || known.length ? [] : [query.replace(/\b(AND|OR)\b/gi, " ").replace(/[()]/g, " ").replace(/\s+/g, " ").trim()];
-  return [...new Set([...quoted, ...known, ...fallback].map((term) => term.trim()).filter(Boolean))].slice(0, 3);
+  const fallback = quoted.length ? [] : extractSearchTerms(query);
+  return [...new Set([...quoted, ...fallback].map((term) => term.trim()).filter(Boolean))].slice(0, 3);
 }
 
-function defaultAi4sTopicProfile(): TopicProfile {
+function topicProfileFromMetadata(value: unknown, question: string): TopicProfile {
+  const profile = value && typeof value === "object" ? value as any : {};
+  const coreTerms = termsOf(profile.coreTerms ?? profile.core_terms);
+  const domainTerms = termsOf(profile.domainTerms ?? profile.domain_terms);
+  const modifierTerms = termsOf(profile.modifierTerms ?? profile.modifier_terms);
+  const extracted = extractSearchTerms(question);
   return {
-    coreTerms: [
-      "ai4s",
-      "ai for science",
-      "artificial intelligence for science",
-      "ai-driven scientific discovery",
-      "scientific discovery",
-      "scientific machine learning",
-      "foundation models for science",
-      "machine learning for science"
-    ],
-    domainTerms: [
-      "materials discovery",
-      "drug discovery",
-      "protein design",
-      "climate modeling",
-      "autonomous laboratory",
-      "autonomous laboratories",
-      "robot scientist",
-      "self-driving laboratory",
-      "physics-informed neural networks",
-      "simulation surrogate",
-      "biopharmaceutical r&d",
-      "molecular generation",
-      "crystal structure prediction"
-    ],
-    modifierTerms: [
-      "development status",
-      "current status",
-      "trend",
-      "trends",
-      "future direction",
-      "future directions",
-      "roadmap",
-      "review",
-      "survey",
-      "现状",
-      "趋势",
-      "发展"
-    ]
+    topicLabel: typeof profile.topicLabel === "string" ? profile.topicLabel : question,
+    coreTerms: coreTerms.length ? coreTerms : extracted,
+    domainTerms,
+    modifierTerms: modifierTerms.length ? modifierTerms : defaultModifierTerms()
   };
 }
 
-function topicProfileFromQueries(queries: any): TopicProfile {
-  const fallback = defaultAi4sTopicProfile();
+function topicProfileFromQueries(queries: any, question = "", metadataProfile?: unknown): TopicProfile {
+  const fallback = topicProfileFromMetadata(metadataProfile, question);
+  const conceptTerms = conceptTermsOf(queries?.concepts);
   return {
-    coreTerms: termsOf(queries?.coreTerms).length ? termsOf(queries?.coreTerms) : fallback.coreTerms,
+    topicLabel: queries?.researchQuestion ?? queries?.question ?? fallback.topicLabel,
+    coreTerms: termsOf(queries?.coreTerms).length ? termsOf(queries?.coreTerms) : conceptTerms.length ? conceptTerms : fallback.coreTerms,
     domainTerms: termsOf(queries?.domainTerms).length ? termsOf(queries?.domainTerms) : fallback.domainTerms,
     modifierTerms: termsOf(queries?.modifierTerms).length ? termsOf(queries?.modifierTerms) : fallback.modifierTerms
   };
@@ -1513,6 +1459,45 @@ function topicProfileFromQueries(queries: any): TopicProfile {
 
 function termsOf(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String).map((s) => s.trim()).filter(Boolean) : [];
+}
+
+function conceptTermsOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueQueries(value.flatMap((concept: any) => [
+    concept?.name,
+    concept?.label,
+    concept?.term,
+    ...(Array.isArray(concept?.synonyms) ? concept.synonyms : [])
+  ]));
+}
+
+function defaultModifierTerms(): string[] {
+  return ["development status", "current status", "trend", "trends", "future direction", "future directions", "roadmap", "review", "survey", "现状", "趋势", "发展"];
+}
+
+function extractSearchTerms(value: string): string[] {
+  const quoted = [...value.matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter(Boolean);
+  const acronyms = [...value.matchAll(/\b[A-Z][A-Z0-9]{2,}\b/g)].map((match) => match[0]);
+  const englishPhrases = value
+    .replace(/["()]/g, " ")
+    .split(/\b(?:AND|OR|WITH|FOR|IN|ON|OF|THE|A|AN)\b|[,;，；:：]/i)
+    .map((part) => part.trim())
+    .filter((part) => /[a-zA-Z]/.test(part) && part.length >= 4);
+  const chinese = value
+    .replace(/[A-Za-z0-9"()]/g, " ")
+    .split(/[\s,;，；:：的和与及、]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 2 && !defaultModifierTerms().includes(part));
+  const whole = value.trim() ? [value.trim()] : [];
+  return uniqueQueries([...quoted, ...acronyms, ...englishPhrases, ...chinese, ...whole]).slice(0, 8);
+}
+
+function quoteQueryTerm(term: string): string {
+  return /\s/.test(term) ? `"${term.replace(/"/g, "")}"` : term;
+}
+
+function booleanOr(terms: string[]): string {
+  return uniqueQueries(terms).map(quoteQueryTerm).join(" OR ");
 }
 
 function normalizeText(value: string): string {
@@ -1533,16 +1518,9 @@ async function listArtifactsByType(services: RuntimeServices, artifactIds: strin
   return out;
 }
 
-function inferConcepts(question: string): any[] {
-  if (/ai4s|AI4S/i.test(question)) {
-    return [
-      { name: "AI4S", synonyms: ["AI for Science", "Artificial Intelligence for Science", "AI-driven scientific discovery"], required: true },
-      { name: "Scientific machine learning", synonyms: ["machine learning for science", "physics-informed neural networks"], required: false },
-      { name: "Autonomous scientific discovery", synonyms: ["autonomous laboratory", "self-driving laboratory", "robot scientist"], required: false },
-      { name: "Domain discovery", synonyms: ["materials discovery", "drug discovery", "protein design", "climate modeling"], required: false }
-    ];
-  }
-  return question.split(/\s+/).filter((w) => w.length > 3).slice(0, 10).map((name) => ({ name, synonyms: [], required: false }));
+function inferConcepts(question: string, profile?: TopicProfile): any[] {
+  const topicProfile = profile ?? topicProfileFromMetadata(undefined, question);
+  return topicProfile.coreTerms.slice(0, 10).map((name, index) => ({ name, synonyms: [], required: index === 0 }));
 }
 
 function topicAnchorScore(paper: PaperHit, profile: TopicProfile): { anchored: boolean; score: number; coreHits: string[]; domainHits: string[]; modifierHits: string[] } {
@@ -1564,8 +1542,8 @@ function screenPaper(_question: string, paper: PaperHit, profile: TopicProfile):
     decision,
     criteria: decision === "include" ? ["IC1", paper.abstract ? "IC2" : "IC3"] : ["EC1"],
     reason: decision === "include"
-      ? `Included: matched AI4S topic anchors. Core hits: ${anchor.coreHits.join(", ") || "none"}; domain hits: ${anchor.domainHits.join(", ") || "none"}.`
-      : `Excluded: no sufficient AI4S topic anchor. Modifier-only hits: ${anchor.modifierHits.join(", ") || "none"}.`,
+      ? `Included: matched topic anchors. Core hits: ${anchor.coreHits.join(", ") || "none"}; domain hits: ${anchor.domainHits.join(", ") || "none"}.`
+      : `Excluded: no sufficient topic anchor. Modifier-only hits: ${anchor.modifierHits.join(", ") || "none"}.`,
     confidence: Math.min(0.95, Math.max(0.35, anchor.score / 4))
   };
 }
