@@ -320,6 +320,48 @@ npm run build
 npm test
 ```
 
+### 运行 CLI 的方式
+
+从源码 clone 后，`npm install` 和 `npm run build` 只会安装依赖并编译项目，不会自动把 `jiuwen-sci` 注册成全局命令。如果直接运行 `jiuwen-sci` 出现 `command not found`，通常是因为还没有执行 `npm link`，或者 npm global bin 不在当前 shell 的 `PATH` 中。
+
+推荐开发期使用 npm script：
+
+```bash
+npm run jiuwen-sci -- --model mock:deterministic doctor
+npm run jiuwen-sci -- --model volcengine:glm-5.2
+```
+
+也可以直接运行编译后的 CLI：
+
+```bash
+node --experimental-sqlite apps/cli/dist/index.js --model mock:deterministic doctor
+```
+
+如果系统默认 `node` 不是 Node 22，请使用 Node 22 的绝对路径，例如：
+
+```bash
+/root/.nvm/versions/node/v22.22.3/bin/node --experimental-sqlite apps/cli/dist/index.js --model mock:deterministic doctor
+```
+
+如果希望在任意目录直接使用 `jiuwen-sci` 命令，可以在仓库根目录执行：
+
+```bash
+npm link
+```
+
+然后验证：
+
+```bash
+jiuwen-sci --model mock:deterministic doctor
+```
+
+如果仍然 `command not found`，检查 npm 全局 bin 是否在 `PATH` 中：
+
+```bash
+npm bin -g
+echo "$PATH"
+```
+
 ## 配置
 
 ### Mock 模型
@@ -327,13 +369,13 @@ npm test
 Mock provider 可离线运行：
 
 ```bash
-jiuwen-sci --model mock:deterministic doctor
+npm run jiuwen-sci -- --model mock:deterministic doctor
 ```
 
-如果未安装 bin，可使用：
+如果已经执行过 `npm link`，也可以直接使用：
 
 ```bash
-node apps/cli/dist/index.js --model mock:deterministic doctor
+jiuwen-sci --model mock:deterministic doctor
 ```
 
 ### 火山引擎 GLM 5.2
@@ -348,7 +390,7 @@ export OPENAI_BASE_URL="https://ark.cn-beijing.volces.com/api/coding/v3"
 运行：
 
 ```bash
-jiuwen-sci --model volcengine:glm-5.2 doctor
+npm run jiuwen-sci -- --model volcengine:glm-5.2 doctor
 ```
 
 本地开发时也支持从 `/root/.ark-helper/config.yaml` 读取 fallback key。该文件不属于本仓库，不应提交。
@@ -360,7 +402,7 @@ jiuwen-sci --model volcengine:glm-5.2 doctor
 进入 CLI：
 
 ```bash
-jiuwen-sci --model volcengine:glm-5.2
+npm run jiuwen-sci -- --model volcengine:glm-5.2
 ```
 
 输入研究目标：
@@ -384,7 +426,7 @@ jiuwen-sci> /exit
 ### 单轮自动执行
 
 ```bash
-jiuwen-sci --model volcengine:glm-5.2 \
+npm run jiuwen-sci -- --model volcengine:glm-5.2 \
   "请调研 AI agents for scientific discovery 的文献"
 ```
 
@@ -393,7 +435,7 @@ jiuwen-sci --model volcengine:glm-5.2 \
 ### 显式执行文献调研
 
 ```bash
-jiuwen-sci --model volcengine:glm-5.2 \
+npm run jiuwen-sci -- --model volcengine:glm-5.2 \
   literature review "AI4S 的发展现状和趋势" \
   --brief ai4s.yaml \
   --db openalex,arxiv,semantic-scholar,crossref,pubmed,europepmc \
@@ -404,7 +446,7 @@ jiuwen-sci --model volcengine:glm-5.2 \
 快速本地验证：
 
 ```bash
-jiuwen-sci --model mock:deterministic \
+npm run jiuwen-sci -- --model mock:deterministic \
   literature review "AI agents for scientific discovery" \
   --db openalex \
   --limit 2
@@ -413,16 +455,18 @@ jiuwen-sci --model mock:deterministic \
 ### 查看历史和产物
 
 ```bash
-jiuwen-sci session list
-jiuwen-sci session show <session-id>
-jiuwen-sci session tree <session-id>
+npm run jiuwen-sci -- session list
+npm run jiuwen-sci -- session show <session-id>
+npm run jiuwen-sci -- session tree <session-id>
 
-jiuwen-sci artifact list --session <session-id>
-jiuwen-sci artifact cat <artifact-id>
+npm run jiuwen-sci -- artifact list --session <session-id>
+npm run jiuwen-sci -- artifact cat <artifact-id>
 
-jiuwen-sci review list --session <session-id>
-jiuwen-sci provenance trace <artifact-or-node-id>
+npm run jiuwen-sci -- review list --session <session-id>
+npm run jiuwen-sci -- provenance trace <artifact-or-node-id>
 ```
+
+如果已经执行 `npm link`，以上命令中的 `npm run jiuwen-sci --` 可以替换为 `jiuwen-sci`。
 
 ### 后台执行长任务
 
