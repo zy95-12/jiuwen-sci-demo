@@ -5,7 +5,7 @@
   "type": "module",
   "workspaces": [
     "apps/cli",
-    "packages/core",
+    "core",
     "packages/packs/literature"
   ],
   "bin": {

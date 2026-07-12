@@ -58,8 +58,8 @@ CLI / REPL
 jiuwen-sci/
 ├── apps/
 │   └── cli/                    # jiuwen-sci CLI / REPL
+├── core/                       # 通用 Agent Runtime
 ├── packages/
-│   ├── core/                   # 通用 Agent Runtime
 │   └── packs/
 │       └── literature/         # PRISMA-style 文献调研 pack
 ├── tests/                      # node:test 集成测试

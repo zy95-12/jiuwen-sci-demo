@@ -1,7 +1,7 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/core" },
+    { "path": "core" },
     { "path": "packages/packs/literature" },
     { "path": "apps/cli" }
   ]

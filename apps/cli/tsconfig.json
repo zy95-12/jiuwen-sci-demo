@@ -10,7 +10,7 @@
     "skipLibCheck": true
   },
   "references": [
-    { "path": "../../packages/core" },
+    { "path": "../../core" },
     { "path": "../../packages/packs/literature" }
   ],
   "include": ["src/**/*.ts"]

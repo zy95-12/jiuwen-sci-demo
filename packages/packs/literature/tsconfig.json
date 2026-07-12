@@ -10,6 +10,6 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "references": [{ "path": "../../core" }],
+  "references": [{ "path": "../../../core" }],
   "include": ["src/**/*.ts"]
 }
