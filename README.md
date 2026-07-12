@@ -12,6 +12,7 @@
 - **Local-first**：Session、tool call、artifact、review finding、provenance 默认保存在本地 `.jiuwen-sci/`。
 - **Artifact-first**：协议、检索结果、筛选表、证据表、PRISMA flow、最终报告都落成 artifact，便于追踪和复核。
 - **Verifier-oriented**：Workflow 不再承担“硬编码流程控制”的全部责任，而是作为约束和验证框架；每个 stage 由 deterministic verifier 与 review agent 共同决定是否通过、返工或跳转。
+- **Honest quality boundary**：当前文献调研重点打通可追溯、可审计的执行闭环；自动生成的最终报告还不能直接等同于可发表或可决策的高质量综述。
 
 ## 架构设计
 
@@ -170,6 +171,8 @@ jiuwen-sci/
 5. `citation_synthesis_review`
    - citation verification、BibTeX、PRISMA flow、final report、review findings。
 
+每个 stage 都会产生结构化 artifact，并由 verifier/review agent 记录通过、返工或失败原因。完整审计说明见 [docs/literature-prisma-audit.md](docs/literature-prisma-audit.md)。
+
 已注册数据源 connector：
 
 - OpenAlex
@@ -212,6 +215,27 @@ jiuwen-sci/
 - `prisma_flow.json`
 - `review_findings.json`
 - `final_report.md`
+
+PRISMA 审计链路：
+
+```text
+protocol.json / queries.json
+  -> search_results.json / search_error.json
+  -> identification.json
+  -> citation_chaining.json
+  -> deduped_papers.json
+  -> preference_scores.json
+  -> screening_log.json
+  -> eligibility_log.json / quality_assessment.json
+  -> included_studies.json / evidence_table.json
+  -> contradiction_detection.json
+  -> citation_verification.json / bibtex.bib
+  -> prisma_flow.json
+  -> review_findings.json
+  -> final_report.md
+```
+
+这条链路保证“报告从哪些检索、哪些筛选、哪些证据来”可以被追踪和复核。它不保证最终报告已经达到专家可用质量；主题扩展、查询约束、语义筛选、证据分级和综合写作仍需要继续加强。
 
 已实现的可靠性改进：
 
@@ -446,12 +470,14 @@ git diff --cached
 
 ## 当前限制
 
-- 当前文献调研是 PRISMA-style，不等同于生产级系统综述。
-- Synthesis 仍偏模板化，深度综述能力还需要加强。
+- 当前文献调研是 PRISMA-style 的可追溯执行闭环，不等同于生产级系统综述。
+- 自动报告与“最终可用的调研报告”仍有明显差距：主题漂移、低相关论文误纳入、证据深度不足、综合分析模板化等问题仍会出现。
+- 对 AI4S、AI-Infra 这类宽泛主题，topic expansion 可能把领域词扩得过宽；如果 query 和 screening 没有强制“双锚点”（如 AI 方法 + 科学场景），会召回普通科学领域论文。
+- Preference scoring 当前仍可能过度奖励领域词命中，不能完全替代语义相关性判断。
 - Full-text/PDF 下载和 section-level evidence extraction 尚未实现。
 - Citation chaining 已有 hints 和部分 fetch，但还没有完整的 saturation strategy。
 - Semantic Scholar 未配置 API key 时容易被 429 限流。
-- Reviewer 已能参与 gate，但 claim-level audit、统计数字校验、图表/表格校验仍需增强。
+- Reviewer 已能参与 gate，但对主题漂移、claim-level audit、统计数字校验、图表/表格校验仍需增强。
 - 当前没有 Web UI。
 - 当前没有 notebook/Python kernel、远程 GPU/SLURM、实验调度能力。
 

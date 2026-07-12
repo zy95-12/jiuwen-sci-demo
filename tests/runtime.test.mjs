@@ -869,3 +869,49 @@ test("stage runner falls back when stage agent fails before scaffold", async () 
     await cleanup();
   }
 });
+
+test("successful stage review resolves stale review execution failures", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    const contract = {
+      id: "stale-review-failure-contract",
+      name: "Stale Review Failure Contract",
+      description: "A successful reviewer attempt should clear old transient review failures.",
+      initialStageId: "screening",
+      stages: [{
+        id: "screening",
+        goal: "Create a screening artifact and review it.",
+        review: { agentId: "reviewer", mode: "always" },
+        retryPolicy: { maxAttempts: 1 },
+        gate: {
+          rules: [
+            { when: "review_major", action: "partial" },
+            { when: "passed", action: "next" }
+          ]
+        },
+        run: async (ctx) => {
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log" }) });
+          return { artifactIds: [artifact.id] };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "stale-review-failure-pack", name: "Stale Review Failure Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "screening", cwd: runtime.services.config.cwd });
+    const stale = await runtime.services.reviewStore.create({
+      sessionId: session.id,
+      severity: "major",
+      category: "stage_review_failed",
+      targetType: "stage",
+      targetRef: "screening",
+      description: "Previous reviewer tool call failed."
+    });
+
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "stale-review-failure-contract", userGoal: "screening" });
+
+    assert.equal(result.status, "completed");
+    const findings = await runtime.services.reviewStore.listBySession(session.id);
+    assert.equal(findings.find((finding) => finding.id === stale.id)?.status, "resolved");
+  } finally {
+    await cleanup();
+  }
+});
