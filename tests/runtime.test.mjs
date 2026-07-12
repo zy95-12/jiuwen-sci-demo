@@ -11,7 +11,7 @@ import {
   StageContractRunner,
   ToolRuntime
 } from "@jiuwen-sci/core";
-import { getLiteratureConnectorRegistry, literaturePack, normalizeLiteratureDatabaseIds } from "@jiuwen-sci/literature-pack";
+import { getLiteratureConnectorRegistry, literaturePack, normalizeLiteratureDatabaseIds, toArxivSearchQuery } from "@jiuwen-sci/literature-pack";
 
 async function tempRuntime() {
   const cwd = await mkdtemp(path.join(tmpdir(), "jiuwen-sci-test-"));
@@ -331,6 +331,44 @@ test("literature database normalization keeps only executable connector ids", as
       { db: "Scopus" }
     ], registry);
     assert.deepEqual(dbs, ["openalex", "semantic-scholar", "fake-executable"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("arXiv query profile converts broad boolean queries into short fielded terms", () => {
+  const query = toArxivSearchQuery('("AI for Science" OR "Artificial Intelligence for Science" OR "AI4S" OR "AI-driven scientific discovery" OR "scientific machine learning") AND (review OR survey OR roadmap OR trend)');
+  assert.equal(query, 'all:"AI for Science" OR all:"Artificial Intelligence for Science" OR all:"AI4S"');
+  assert.ok(query.length < 100);
+});
+
+test("literature search scaffold retries retryable source errors with fallback queries", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    let calls = 0;
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-fallback",
+      name: "Fake Fallback",
+      description: "Fake connector for search fallback",
+      async search(input) {
+        calls += 1;
+        if (calls === 1) throw new Error("temporary network failure");
+        assert.notEqual(input.query, "AI4S的发展现状和趋势");
+        return [
+          { id: "fallback-1", title: "AI for Science fallback query success", authors: ["A"], year: 2026, venue: "Test", url: "https://example.test/fallback-1", sourceDb: "fake-fallback", abstract: "AI for Science and scientific machine learning support discovery trends." }
+        ];
+      }
+    });
+    const result = await runtime.run({ input: "AI4S的发展现状和趋势", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-fallback"], limit: 1 } });
+    assert.equal(result.status, "completed");
+    assert.ok(calls >= 2);
+    const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
+    const identification = artifacts.map((artifact) => {
+      try { return JSON.parse(artifact.text); } catch { return null; }
+    }).find((parsed) => parsed?.stage === "identification");
+    assert.equal(identification.searchCounts["fake-fallback"], 1);
+    assert.equal(identification.sourceErrors[0].fallbackAvailable, true);
   } finally {
     await cleanup();
   }

@@ -108,36 +108,41 @@ class SourceRequestError extends Error {
   }
 }
 
-async function getJson<T>(url: string, headers?: Record<string, string>): Promise<T> {
-  const res = await requestWithRetry(url, headers);
+type RequestRetryOptions = { attempts?: number; timeoutMs?: number; retryBaseDelayMs?: number };
+
+async function getJson<T>(url: string, headers?: Record<string, string>, options?: RequestRetryOptions): Promise<T> {
+  const res = await requestWithRetry(url, headers, options);
   return res.json() as Promise<T>;
 }
 
-async function getText(url: string, headers?: Record<string, string>): Promise<string> {
-  const res = await requestWithRetry(url, headers);
+async function getText(url: string, headers?: Record<string, string>, options?: RequestRetryOptions): Promise<string> {
+  const res = await requestWithRetry(url, headers, options);
   return res.text();
 }
 
-async function requestWithRetry(url: string, headers?: Record<string, string>, attempts = 3): Promise<Response> {
+async function requestWithRetry(url: string, headers?: Record<string, string>, options: RequestRetryOptions = {}): Promise<Response> {
+  const attempts = options.attempts ?? 3;
+  const timeoutMs = options.timeoutMs ?? 20000;
+  const retryBaseDelayMs = options.retryBaseDelayMs ?? 250;
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), 20000);
+      timeout = setTimeout(() => controller.abort(), timeoutMs);
       const res = await fetch(url, { headers: { "user-agent": "jiuwen-sci/0.1", ...(headers ?? {}) }, signal: controller.signal });
       clearTimeout(timeout);
       timeout = undefined;
       if (res.ok) return res;
       const classified = classifyHttpError(res.status, `${res.status} ${res.statusText}: ${url}`);
       if (!classified.retryable || attempt === attempts) throw classified;
-      await sleep(250 * attempt * attempt);
+      await sleep(retryBaseDelayMs * attempt * attempt);
     } catch (error) {
       if (timeout) clearTimeout(timeout);
       lastError = error;
       const requestError = toSourceRequestError(error, url);
       if (!requestError.retryable || attempt === attempts) throw requestError;
-      await sleep(250 * attempt * attempt);
+      await sleep(retryBaseDelayMs * attempt * attempt);
     }
   }
   throw toSourceRequestError(lastError, url);
@@ -249,10 +254,10 @@ export class ArxivConnector implements LiteratureConnector {
   };
   async search(input: LiteratureSearchInput): Promise<PaperHit[]> {
     const url = new URL("https://export.arxiv.org/api/query");
-    url.searchParams.set("search_query", `all:${input.query}`);
+    url.searchParams.set("search_query", toArxivSearchQuery(input.query));
     url.searchParams.set("start", "0");
-    url.searchParams.set("max_results", String(input.limit ?? 25));
-    const xml = await getText(url.toString());
+    url.searchParams.set("max_results", String(Math.min(input.limit ?? 10, 10)));
+    const xml = await getText(url.toString(), undefined, { attempts: 4, timeoutMs: 60000, retryBaseDelayMs: 3000 });
     return [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m): PaperHit => {
       const entry = m[1] ?? "";
       const id = text(entry, "id");
@@ -909,14 +914,15 @@ export const literatureReviewStageContract: StageContractDefinition = {
           database: normalizeLiteratureDatabaseIds(query.database, registry)[0] ?? query.database
         }));
         for (const db of dbs) {
-          const query = selectedQueries.find((q: any) => q.database === db)?.query ?? ctx.input;
-          const result = await ctx.tool({ toolId: "science_search", input: { db, query, limit } });
-          const out = result.output as any;
+          const querySpec = selectedQueries.find((q: any) => q.database === db);
+          const queries = uniqueQueries([querySpec?.query ?? ctx.input, ...(querySpec?.fallbackQueries ?? []), ...dbFallbackQueries(db, ctx.input)]);
+          const { out, artifactIds, errors } = await searchWithFallback(ctx, db, queries, limit);
           allPapers.push(...(out.results ?? []));
           searchCounts[db] = out.count ?? 0;
-          if (out.ok === false) sourceErrors.push(out);
+          sourceErrors.push(...errors);
+          if (out.ok === false && !errors.includes(out)) sourceErrors.push(out);
           else if (out.error) sourceErrors.push({ db, error: out.error });
-          if (out.artifactId) searchArtifactIds.push(out.artifactId);
+          searchArtifactIds.push(...artifactIds);
         }
         const chain = await ctx.tool({ toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
         const citationChainArtifactId = (chain.output as any).artifactId as string;
@@ -1311,14 +1317,48 @@ function databaseKey(value: string): string {
   return value.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string }[] {
+function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string; fallbackQueries?: string[] }[] {
   const raw = value?.selectedQueries ?? value?.selected_queries ?? value?.queries ?? [];
   if (!Array.isArray(raw)) return [];
   return raw.map((query: any) => ({
     database: query?.database ?? query?.db ?? query?.source,
     query: query?.query ?? query?.queryString ?? query?.query_string,
-    rationale: query?.rationale ?? query?.query_logic
+    rationale: query?.rationale ?? query?.query_logic,
+    fallbackQueries: Array.isArray(query?.fallbackQueries ?? query?.fallback_queries) ? (query.fallbackQueries ?? query.fallback_queries).map(String) : undefined
   })).filter((query) => query.database || query.query);
+}
+
+async function searchWithFallback(ctx: any, db: string, queries: string[], limit: number): Promise<{ out: any; artifactIds: string[]; errors: any[] }> {
+  const artifactIds: string[] = [];
+  const errors: any[] = [];
+  let lastOut: any = { ok: false, db, count: 0, results: [] };
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
+    const result = await ctx.tool({ toolId: "science_search", input: { db, query, limit: index === 0 ? limit : Math.min(limit, db === "arxiv" ? 10 : limit) } });
+    const out = result.output as any;
+    lastOut = out;
+    if (out.artifactId) artifactIds.push(out.artifactId);
+    if (out.ok === false) {
+      errors.push({ ...out, fallbackAttempt: index, fallbackAvailable: index < queries.length - 1 });
+      if (out.retryable && index < queries.length - 1) continue;
+    }
+    return { out, artifactIds, errors };
+  }
+  return { out: lastOut, artifactIds, errors };
+}
+
+function uniqueQueries(queries: any[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const query of queries) {
+    const value = String(query ?? "").trim();
+    if (!value) continue;
+    const key = normalizeText(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
 }
 
 type TopicProfile = {
@@ -1345,12 +1385,77 @@ function buildQueryPlan(question: string, dbs: string[], criteria: unknown): any
     domainTerms: ai4s.domainTerms,
     modifierTerms: ai4s.modifierTerms,
     criteria,
-    selectedQueries: dbs.map((db) => ({ database: db, query: `${trendQuery} OR ${domainQuery}`, rationale: "Expanded AI4S query with core concept anchors, domain applications, and trend/review modifiers." })),
+    selectedQueries: dbs.map((db) => databaseSearchQuery(db, trendQuery, domainQuery)),
     alternativeQueries: dbs.flatMap((db) => [
       { database: db, query: broadQuery, rationale: "High-precision AI4S core concept query." },
       { database: db, query: domainQuery, rationale: "Domain-expansion query for AI4S application areas." }
     ])
   };
+}
+
+function databaseSearchQuery(db: string, trendQuery: string, domainQuery: string): any {
+  if (db === "arxiv") {
+    return {
+      database: db,
+      query: '"AI for Science" OR "scientific machine learning"',
+      fallbackQueries: [
+        '"physics-informed neural networks"',
+        '"machine learning" "scientific discovery"',
+        '"foundation models" science'
+      ],
+      rationale: "arXiv API is more reliable with short technical queries; use fallback queries for recall instead of one long Boolean expression."
+    };
+  }
+  return {
+    database: db,
+    query: `${trendQuery} OR ${domainQuery}`,
+    fallbackQueries: dbFallbackQueries(db),
+    rationale: "Expanded AI4S query with core concept anchors, domain applications, and trend/review modifiers."
+  };
+}
+
+function dbFallbackQueries(db: string, question = ""): string[] {
+  if (db === "arxiv") {
+    return [
+      '"AI for Science"',
+      '"scientific machine learning"',
+      '"physics-informed neural networks"',
+      '"machine learning" "materials discovery"',
+      '"machine learning" "drug discovery"'
+    ];
+  }
+  if (/AI4S|AI for Science|发展现状|趋势/i.test(question)) {
+    return [
+      '"AI for Science"',
+      '"scientific machine learning"',
+      '"AI-driven scientific discovery"'
+    ];
+  }
+  return [];
+}
+
+export function toArxivSearchQuery(query: string): string {
+  const terms = arxivTerms(query);
+  if (!terms.length) return `all:${query}`;
+  return terms.map((term) => `all:"${term.replace(/"/g, "")}"`).join(" OR ");
+}
+
+function arxivTerms(query: string): string[] {
+  const quoted = [...query.matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter(Boolean);
+  const known = [
+    "AI for Science",
+    "scientific machine learning",
+    "physics-informed neural networks",
+    "foundation models",
+    "machine learning",
+    "scientific discovery",
+    "materials discovery",
+    "drug discovery",
+    "protein design",
+    "climate modeling"
+  ].filter((term) => query.toLowerCase().includes(term.toLowerCase()));
+  const fallback = quoted.length || known.length ? [] : [query.replace(/\b(AND|OR)\b/gi, " ").replace(/[()]/g, " ").replace(/\s+/g, " ").trim()];
+  return [...new Set([...quoted, ...known, ...fallback].map((term) => term.trim()).filter(Boolean))].slice(0, 3);
 }
 
 function defaultAi4sTopicProfile(): TopicProfile {
