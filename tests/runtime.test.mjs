@@ -272,9 +272,15 @@ test("literature PRISMA separates citation-chain hints from screened records", a
     assert.equal(identification.recordsIdentifiedThroughDatabaseSearching, 1);
     assert.equal(identification.recordsIdentifiedThroughCitationChaining, 0);
     assert.equal(identification.citationChainHintsFound, 3);
+    assert.equal(identification.citationChainHandling.mode, "hints_only");
+    assert.equal(identification.citationChainHandling.recordsPromotedToScreening, false);
     assert.equal(prisma.recordsIdentifiedThroughCitationChaining, 0);
     assert.equal(prisma.citationChainHintsFound, 3);
+    assert.equal(prisma.citationChainHandling.mode, "hints_only");
+    assert.equal(prisma.citationChainHandling.recordsPromotedToScreening, false);
     assert.equal(prisma.totalRecordsIdentified, 1);
+    const final = artifacts.find((artifact) => artifact.text.includes("# PRISMA-Style Literature Review"));
+    assert.match(final.text, /Citation-chain handling: hints only/);
   } finally {
     await cleanup();
   }

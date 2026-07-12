@@ -29,6 +29,13 @@ async function runLiteratureStageContract(ctx: WorkflowContext, question: string
   });
 }
 
+const citationChainHintsOnlyPolicy = {
+  mode: "hints_only",
+  recordsPromotedToScreening: false,
+  rationale: "Citation-chain references/citations are captured as audit hints in v0, but are not normalized, deduplicated, or screened as independent candidate records.",
+  limitation: "This is a known coverage limitation versus full systematic-review workflows; citation-chain records should be merged into dedupe/screening in a future version."
+};
+
 export const literatureReviewStageContract: StageContractDefinition = {
   id: "literature-review-prisma-v1",
   name: "Literature Review PRISMA Stage Contract",
@@ -163,12 +170,12 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const citationChainHintsFound = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
         const recordsIdentifiedThroughCitationChaining = 0;
         if (Array.isArray((chain.output as any).errors)) sourceErrors.push(...(chain.output as any).errors);
-        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, topicExpansionId: ctx.state.topicExpansionArtifactId, appliedPreferences: protocolPreferenceSummary(ctx.metadata), recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, topicExpansionId: ctx.state.topicExpansionArtifactId, appliedPreferences: protocolPreferenceSummary(ctx.metadata), recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound, citationChainHandling: citationChainHintsOnlyPolicy, auditNotes: ["Citation-chain records are not included in recordsIdentifiedThroughCitationChaining in v0 because they are retained as hints only."] }, null, 2) });
         const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
         const deduped = (dedupe.output as any).papers as PaperHit[];
         const duplicates = (dedupe.output as any).duplicates ?? [];
         const dedupedArtifactId = (dedupe.output as any).artifactId as string;
-        return { artifactIds: [...searchArtifactIds, identification.id, citationChainArtifactId, dedupedArtifactId], statePatch: { allPapers, searchCounts, sourceErrors, deduped, duplicates, recordsIdentifiedThroughCitationChaining, citationChainHintsFound, identificationArtifactId: identification.id, citationChainArtifactId, dedupedArtifactId } };
+        return { artifactIds: [...searchArtifactIds, identification.id, citationChainArtifactId, dedupedArtifactId], statePatch: { allPapers, searchCounts, sourceErrors, deduped, duplicates, recordsIdentifiedThroughCitationChaining, citationChainHintsFound, citationChainHandling: citationChainHintsOnlyPolicy, identificationArtifactId: identification.id, citationChainArtifactId, dedupedArtifactId } };
       }
     },
     {
@@ -179,7 +186,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         "- Check topic drift: included papers must match the review concepts, not only broad trend or methodology words.",
         "- Check criterion consistency against protocol/query artifacts; flag undocumented changes in date range, study type, source scope, or inclusion/exclusion rules.",
         "- Check source coverage gaps: rate limits, failed databases, or unsupported sources should be documented and considered in the review risk.",
-        "- Check citation-chain handling: if citation-chain hints are not merged into screening, the omission or rationale must be auditable in later PRISMA artifacts.",
+        "- Check citation-chain handling: v0 uses citation-chain records as hints only. Do not flag this as a PRISMA gap when identification/prisma artifacts explicitly state citationChainHandling.mode=\"hints_only\" and recordsPromotedToScreening=false; do flag it if the handling/rationale is missing or internally inconsistent.",
         "- Typical categories: topic_drift, prisma_flow_gap, criterion_drift, source_coverage_gap, screening_rigor."
       ].join("\n"),
       agentId: "literature-screening-agent",
@@ -345,11 +352,13 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const bibtexArtifactId = (bibtex.output as any).artifactId as string;
         const recordsIdentifiedThroughCitationChaining = Number(ctx.state.recordsIdentifiedThroughCitationChaining ?? 0);
         const citationChainHintsFound = Number(ctx.state.citationChainHintsFound ?? 0);
+        const citationChainHandling = ctx.state.citationChainHandling ?? citationChainHintsOnlyPolicy;
         const reviewFindingsTree = (await ctx.services.reviewStore.listBySessionTree(ctx.sessionId)).filter((finding) => finding.status === "open");
         const prisma = {
           recordsIdentifiedThroughDatabaseSearching: allPapers.length,
           recordsIdentifiedThroughCitationChaining,
           citationChainHintsFound,
+          citationChainHandling,
           totalRecordsIdentified: allPapers.length + recordsIdentifiedThroughCitationChaining,
           duplicateRecordsRemoved: duplicates.length,
           recordsAfterDeduplication: deduped.length,

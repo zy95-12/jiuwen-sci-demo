@@ -519,7 +519,7 @@ git diff --cached
 - 对 AI4S、AI-Infra 这类宽泛主题，topic expansion 可能把领域词扩得过宽；如果 query 和 screening 没有强制“双锚点”（如 AI 方法 + 科学场景），会召回普通科学领域论文。
 - Preference scoring 当前仍可能过度奖励领域词命中，不能完全替代语义相关性判断。
 - Full-text/PDF 下载和 section-level evidence extraction 尚未实现。
-- Citation chaining 已有 hints 和部分 fetch，但还没有完整的 saturation strategy。
+- Citation chaining 当前执行 B 策略：只作为 audit hints 记录，不并入 dedupe/screening/eligibility 候选池；这是已审计的 v0 限制。
 - Semantic Scholar 未配置 API key 时容易被 429 限流。
 - Reviewer 已能参与 gate，但对主题漂移、claim-level audit、统计数字校验、图表/表格校验仍需增强。
 - 当前没有 Web UI。
@@ -541,6 +541,7 @@ git diff --cached
 - PDF/full-text 获取。
 - section-level evidence extraction。
 - DOI/PMID/arXiv ID 交叉验证。
+- **OpenScience 对标重大 gap**：将 citation-chain records 正式合并进 dedupe/screening/eligibility，而不是仅作为 hints 审计；需要补充 citation graph record normalization、去重、筛选、PRISMA 计数和 saturation criterion。
 - citation graph 深度扩展和 saturation criterion。
 - ASReview-style active screening。
 - contradiction clustering。
