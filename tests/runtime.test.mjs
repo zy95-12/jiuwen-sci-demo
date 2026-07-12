@@ -85,6 +85,24 @@ test("blocking review finding blocks finalize", async () => {
   }
 });
 
+test("artifact_write serializes structured JSON input when content is omitted", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    const session = await runtime.services.sessionStore.create({ agentId: "task-agent", input: "artifact", cwd: runtime.services.config.cwd });
+    const result = await new ToolRuntime(runtime.services).execute({
+      sessionId: session.id,
+      agentId: "task-agent",
+      toolId: "artifact_write",
+      input: { type: "json", mediaType: "application/json", name: "Protocol", stage: "protocol", question: "AI4S" }
+    });
+    const artifact = JSON.parse((await runtime.services.artifactStore.read(result.output.artifactId)).toString("utf8"));
+    assert.equal(artifact.stage, "protocol");
+    assert.equal(artifact.question, "AI4S");
+  } finally {
+    await cleanup();
+  }
+});
+
 test("literature workflow runs with fake connector and creates traceable report", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {
@@ -197,6 +215,46 @@ test("citation chain fetches connector citation graph metadata", async () => {
     assert.equal(result.output.records[0].referenceCount, 1);
     assert.equal(result.output.records[0].citationCount, 1);
     assert.equal(result.output.records[0].references[0].doi, "10.1/ref");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("literature PRISMA separates citation-chain hints from screened records", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-chain-review",
+      name: "Fake Chain Review",
+      description: "Fake connector with citation graph hints",
+      async search() {
+        return [
+          { id: "chain-seed", title: "AI for Science materials discovery review", authors: ["A"], year: 2026, venue: "Test", url: "https://example.test/chain-seed", sourceDb: "fake-chain-review", abstract: "AI for Science accelerates materials discovery and autonomous laboratories." }
+        ];
+      },
+      async fetch(id) {
+        return {
+          id,
+          references: [{ id: "ref-a", title: "Reference A" }, { id: "ref-b", title: "Reference B" }],
+          citations: [{ id: "cite-a", title: "Citation A" }]
+        };
+      }
+    });
+    const result = await runtime.run({ input: "AI4S materials discovery trends", strategy: "workflow_controlled", metadata: { workflow: "literature-review", dbs: ["fake-chain-review"], limit: 1 } });
+    assert.equal(result.status, "completed");
+    const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
+    const parsed = artifacts.map((artifact) => {
+      try { return JSON.parse(artifact.text); } catch { return null; }
+    });
+    const identification = parsed.find((item) => item?.stage === "identification");
+    const prisma = parsed.find((item) => item?.stage === "prisma_flow");
+    assert.equal(identification.recordsIdentifiedThroughDatabaseSearching, 1);
+    assert.equal(identification.recordsIdentifiedThroughCitationChaining, 0);
+    assert.equal(identification.citationChainHintsFound, 3);
+    assert.equal(prisma.recordsIdentifiedThroughCitationChaining, 0);
+    assert.equal(prisma.citationChainHintsFound, 3);
+    assert.equal(prisma.totalRecordsIdentified, 1);
   } finally {
     await cleanup();
   }
@@ -384,6 +442,93 @@ test("stage gate policy can redirect to a pack-defined stage", async () => {
     const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "redirect-contract", userGoal: "redirect" });
     assert.equal(result.status, "completed");
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.redirected" && event.stageId === "work" && event.nextStageId === "plan"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage gate treats high severity review findings as major failures", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.services.reviewerRegistry.register({
+      id: "high-reviewer",
+      name: "High Reviewer",
+      description: "Writes a high severity finding.",
+      async review(ctx) {
+        const finding = await ctx.services.reviewStore.create({
+          sessionId: ctx.sessionId,
+          severity: "high",
+          category: "semantic_inconsistency",
+          targetType: "stage",
+          targetRef: "draft",
+          description: "High severity issue."
+        });
+        return { findingIds: [finding.id], blockingFindingIds: [], summary: "high issue" };
+      }
+    });
+    const contract = {
+      id: "high-review-contract",
+      name: "High Review Contract",
+      description: "High severity review should not pass.",
+      initialStageId: "draft",
+      stages: [{
+        id: "draft",
+        goal: "Draft with high review issue.",
+        gate: {
+          semantic: { reviewerId: "high-reviewer", mode: "always" },
+          rules: [
+            { when: "review_major", action: "partial" },
+            { when: "passed", action: "next" }
+          ]
+        },
+        run: async (ctx) => {
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "draft" }) });
+          return { artifactIds: [artifact.id] };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "high-review-pack", name: "High Review Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "high", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "high-review-contract", userGoal: "high" });
+    assert.equal(result.status, "partial");
+    const findings = await runtime.services.reviewStore.listBySessionTree(session.id);
+    assert.ok(findings.some((finding) => finding.severity === "high" && finding.category === "semantic_inconsistency"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage verifier sees open blocking findings in child sessions", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    const contract = {
+      id: "child-blocking-contract",
+      name: "Child Blocking Contract",
+      description: "Child blocking finding should fail root gate.",
+      initialStageId: "draft",
+      stages: [{
+        id: "draft",
+        goal: "Create a child blocking finding.",
+        gate: {
+          deterministic: [{ id: "no_open_blocking_findings", hardGate: true }],
+          rules: [
+            { when: "hard_gate_failed", action: "partial" },
+            { when: "passed", action: "next" }
+          ]
+        },
+        run: async (ctx) => {
+          const child = await ctx.services.sessionStore.create({ parentId: ctx.sessionId, agentId: "task-agent", input: "child", cwd: runtime.services.config.cwd });
+          await ctx.services.reviewStore.create({ sessionId: child.id, severity: "blocking", category: "child_block", targetType: "session", targetRef: child.id, description: "Child session blocks the stage." });
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "draft" }) });
+          return { artifactIds: [artifact.id] };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "child-blocking-pack", name: "Child Blocking Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "child blocking", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "child-blocking-contract", userGoal: "child blocking" });
+    assert.equal(result.status, "partial");
+    assert.ok(result.reviewFindingIds.length >= 1);
   } finally {
     await cleanup();
   }

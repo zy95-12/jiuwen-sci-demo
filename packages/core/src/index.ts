@@ -71,7 +71,7 @@ export type Artifact = {
 export type ReviewFinding = {
   id: string;
   sessionId: string;
-  severity: "blocking" | "major" | "minor" | "info";
+  severity: "blocking" | "high" | "major" | "minor" | "info";
   category: string;
   targetType: string;
   targetRef: string;
@@ -163,7 +163,7 @@ export type ArtifactRequirement = {
 export type StageVerifierResult = {
   ok: boolean;
   message: string;
-  severity?: "blocking" | "major" | "minor" | "info";
+  severity?: "blocking" | "high" | "major" | "minor" | "info";
   category?: string;
   targetRef?: string;
 };
@@ -488,8 +488,33 @@ export class SqliteReviewStore {
   async listBySession(sessionId: string): Promise<ReviewFinding[]> {
     return this.db.all<any>("select * from review_findings where session_id = ? order by created_at asc", [sessionId]).map(mapFinding);
   }
+  async listBySessionTree(sessionId: string): Promise<ReviewFinding[]> {
+    return this.db.all<any>(`
+      with recursive session_tree(id) as (
+        select id from sessions where id = ?
+        union all
+        select sessions.id from sessions join session_tree on sessions.parent_id = session_tree.id
+      )
+      select review_findings.* from review_findings
+      join session_tree on review_findings.session_id = session_tree.id
+      order by review_findings.created_at asc
+    `, [sessionId]).map(mapFinding);
+  }
   async listOpenBlocking(sessionId: string): Promise<ReviewFinding[]> {
     return this.db.all<any>("select * from review_findings where session_id = ? and severity = 'blocking' and status = 'open'", [sessionId]).map(mapFinding);
+  }
+  async listOpenBlockingBySessionTree(sessionId: string): Promise<ReviewFinding[]> {
+    return this.db.all<any>(`
+      with recursive session_tree(id) as (
+        select id from sessions where id = ?
+        union all
+        select sessions.id from sessions join session_tree on sessions.parent_id = session_tree.id
+      )
+      select review_findings.* from review_findings
+      join session_tree on review_findings.session_id = session_tree.id
+      where review_findings.severity = 'blocking' and review_findings.status = 'open'
+      order by review_findings.created_at asc
+    `, [sessionId]).map(mapFinding);
   }
   async acceptRisk(ids: string[]): Promise<void> {
     for (const id of ids) this.db.run("update review_findings set status='accepted_risk' where id=?", [id]);
@@ -718,9 +743,9 @@ export function registerCoreStageVerifiers(registry: InMemoryStageVerifierRegist
   });
   registry.register({
     id: "no_open_blocking_findings",
-    description: "Verify that the current session has no open blocking review findings.",
+    description: "Verify that the current session tree has no open blocking review findings.",
     async verify(ctx) {
-      const blocking = await ctx.services.reviewStore.listOpenBlocking(ctx.sessionId);
+      const blocking = await ctx.services.reviewStore.listOpenBlockingBySessionTree(ctx.sessionId);
       return blocking.length
         ? { ok: false, message: `Open blocking findings remain: ${blocking.map((f) => f.id).join(", ")}`, severity: "blocking", category: "blocking_findings" }
         : { ok: true, message: "No open blocking findings." };
@@ -732,9 +757,15 @@ const objectSchema = { type: "object" };
 const stringProp = { type: "string", minLength: 1 };
 
 export const artifactWriteTool: ToolDefinition<any, any> = {
-  id: "artifact_write", name: "Artifact Write", description: "Create an artifact.", inputSchema: { type: "object", required: ["content"], properties: { type: stringProp, mediaType: stringProp, content: { type: "string" }, name: stringProp } }, outputSchema: objectSchema, permission: { kind: "runtime" },
+  id: "artifact_write", name: "Artifact Write", description: "Create an artifact. Prefer passing content as a string; if omitted, structured fields are serialized as JSON.", inputSchema: { type: "object", properties: { type: stringProp, mediaType: stringProp, content: { type: "string" }, name: stringProp } }, outputSchema: objectSchema, permission: { kind: "runtime" },
   async execute(ctx, input) {
-    const artifact = await ctx.createArtifact({ type: input.type ?? "markdown", mediaType: input.mediaType ?? "text/markdown", content: String(input.content ?? "") });
+    const hasExplicitContent = typeof input.content === "string";
+    const structured = Object.fromEntries(Object.entries(input).filter(([key]) => !["type", "mediaType", "name", "content"].includes(key)));
+    const inferredJson = Object.keys(structured).length > 0;
+    const type = input.type ?? (inferredJson ? "json" : "markdown");
+    const mediaType = input.mediaType ?? (type === "json" ? "application/json" : "text/markdown");
+    const content = hasExplicitContent ? input.content : (inferredJson ? JSON.stringify(structured, null, 2) : "");
+    const artifact = await ctx.createArtifact({ type, mediaType, content });
     await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: input.name ?? "Artifact" }, { type: "tool_call", refId: ctx.toolCallId, label: ctx.toolCallId }], edges: [{ type: "created", fromRef: ctx.toolCallId, toRef: artifact.id }] });
     return { artifactId: artifact.id, path: artifact.path, size: artifact.size };
   }
@@ -1042,7 +1073,7 @@ export class StageContractRunner {
     }
 
     if (currentId) status = "partial";
-    const findings = await this.services.reviewStore.listBySession(input.sessionId);
+    const findings = await this.services.reviewStore.listBySessionTree(input.sessionId);
     reviewFindingIds = [...new Set([...reviewFindingIds, ...findings.map((f) => f.id)])];
     await this.services.sessionStore.update(input.sessionId, { status: status === "completed" ? "completed" : status, artifactIds: [...new Set(artifactIds)] });
     return { sessionId: input.sessionId, status, output, artifactIds: [...new Set(artifactIds)], reviewFindingIds };
@@ -1198,7 +1229,7 @@ export class StageContractRunner {
     }
 
     const reviewBlocking = semanticFindings.some((finding) => finding.severity === "blocking" && finding.status === "open");
-    const reviewMajor = semanticFindings.some((finding) => finding.severity === "major" && finding.status === "open");
+    const reviewMajor = semanticFindings.some((finding) => ["high", "major"].includes(finding.severity) && finding.status === "open");
     const action = decideGateAction({ stage, deterministicOk, hardGateFailed, reviewBlocking, reviewMajor, deterministicResults, semanticFindings });
     return { ...action, messages: [...messages, ...semanticFindings.map((finding) => finding.description)], findingIds, reportArtifactId: report.id };
   }
@@ -1300,7 +1331,7 @@ function renderStageAgentPrompt(input: { contract: StageContractDefinition; stag
     `Verifiers that will judge completion:\n${verifiers}`,
     `Artifact manifest:\n${JSON.stringify(input.artifactManifest, null, 2)}`,
     feedback,
-    "Produce the required structured artifacts with artifact_write before finalizing. For JSON artifacts, include the declared stage field exactly. If reading an artifact, copy artifactId exactly from the manifest; never call artifact_read with an empty or invented artifactId."
+    "Produce the required structured artifacts with artifact_write before finalizing. For JSON artifacts, call artifact_write with type=\"json\", mediaType=\"application/json\", and content equal to a JSON string that includes the declared stage field exactly. Example: artifact_write({\"type\":\"json\",\"mediaType\":\"application/json\",\"content\":\"{\\\"stage\\\":\\\"protocol\\\",\\\"question\\\":\\\"...\\\"}\"}). If reading an artifact, copy artifactId exactly from the manifest; never call artifact_read with an empty or invented artifactId."
   ].filter(Boolean).join("\n\n");
 }
 

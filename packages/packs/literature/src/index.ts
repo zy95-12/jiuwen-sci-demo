@@ -884,7 +884,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const agentDedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
         if (agentIdentification && agentDedupe) {
           const deduped = (agentDedupe.deduped ?? agentDedupe.papers ?? []) as PaperHit[];
-          return { statePatch: { allPapers: deduped, searchCounts: agentIdentification.searchCounts ?? {}, sourceErrors: agentIdentification.sourceErrors ?? [], deduped, duplicates: agentDedupe.duplicates ?? [] } };
+          return { statePatch: { allPapers: deduped, searchCounts: agentIdentification.searchCounts ?? {}, sourceErrors: agentIdentification.sourceErrors ?? [], deduped, duplicates: agentDedupe.duplicates ?? [], recordsIdentifiedThroughCitationChaining: Number(agentIdentification.recordsIdentifiedThroughCitationChaining ?? 0), citationChainHintsFound: Number(agentIdentification.citationChainHintsFound ?? 0) } };
         }
         const dbs = (ctx.state.dbs as string[]) ?? ["openalex"];
         const limit = Number(ctx.state.limit ?? 25);
@@ -906,14 +906,15 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const chain = await ctx.tool({ toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
         const citationChainArtifactId = (chain.output as any).artifactId as string;
         const citationChainRecords = (chain.output as any).records ?? [];
-        const recordsIdentifiedThroughCitationChaining = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
+        const citationChainHintsFound = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
+        const recordsIdentifiedThroughCitationChaining = 0;
         if (Array.isArray((chain.output as any).errors)) sourceErrors.push(...(chain.output as any).errors);
-        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining }, null, 2) });
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
         const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
         const deduped = (dedupe.output as any).papers as PaperHit[];
         const duplicates = (dedupe.output as any).duplicates ?? [];
         const dedupedArtifactId = (dedupe.output as any).artifactId as string;
-        return { artifactIds: [...searchArtifactIds, identification.id, citationChainArtifactId, dedupedArtifactId], statePatch: { allPapers, searchCounts, sourceErrors, deduped, duplicates, identificationArtifactId: identification.id, citationChainArtifactId, dedupedArtifactId } };
+        return { artifactIds: [...searchArtifactIds, identification.id, citationChainArtifactId, dedupedArtifactId], statePatch: { allPapers, searchCounts, sourceErrors, deduped, duplicates, recordsIdentifiedThroughCitationChaining, citationChainHintsFound, identificationArtifactId: identification.id, citationChainArtifactId, dedupedArtifactId } };
       }
     },
     {
@@ -1052,10 +1053,14 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const citationVerificationArtifactId = (citationVerification.output as any).artifactId as string;
         const bibtex = await ctx.tool({ toolId: "bibtex_write", input: { papers: included } });
         const bibtexArtifactId = (bibtex.output as any).artifactId as string;
+        const recordsIdentifiedThroughCitationChaining = Number(ctx.state.recordsIdentifiedThroughCitationChaining ?? 0);
+        const citationChainHintsFound = Number(ctx.state.citationChainHintsFound ?? 0);
+        const reviewFindingsTree = (await ctx.services.reviewStore.listBySessionTree(ctx.sessionId)).filter((finding) => finding.status === "open");
         const prisma = {
           recordsIdentifiedThroughDatabaseSearching: allPapers.length,
-          recordsIdentifiedThroughCitationChaining: 0,
-          totalRecordsIdentified: allPapers.length,
+          recordsIdentifiedThroughCitationChaining,
+          citationChainHintsFound,
+          totalRecordsIdentified: allPapers.length + recordsIdentifiedThroughCitationChaining,
           duplicateRecordsRemoved: duplicates.length,
           recordsAfterDeduplication: deduped.length,
           recordsScreened: deduped.length,
@@ -1069,7 +1074,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const prismaFlowArtifactId = (prismaFlow.output as any).artifactId as string;
         const synthesisText = renderSynthesis(ctx.input, included, evidenceRows, quality, contradictions, prisma);
         const synthesis = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: synthesisText });
-        const reviewFindings = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "review_findings", findings: [], summary: "Stage contract ran deterministic verifiers and final semantic reviewer; unresolved unverified citations remain visible in citation_verification.json." }, null, 2) });
+        const reviewFindings = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "review_findings", findings: reviewFindingsTree, summary: reviewFindingsTree.length ? "Open review findings from the session tree are listed here and must be resolved or accepted before treating the report as final." : "No open review findings were present before final semantic review." }, null, 2) });
         const finalReport = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: `${synthesisText}\n\n## Artifact Index\n\n- protocol.json: ${ctx.state.protocolArtifactId}\n- queries.json: ${ctx.state.queriesArtifactId}\n- identification.json: ${ctx.state.identificationArtifactId}\n- citation_chaining.json: ${ctx.state.citationChainArtifactId}\n- deduped_papers.json: ${ctx.state.dedupedArtifactId}\n- screening_log.json: ${ctx.state.screeningLogArtifactId}\n- eligibility_log.json: ${ctx.state.eligibilityLogArtifactId}\n- quality_assessment.json: ${ctx.state.qualityAssessmentArtifactId}\n- included_studies.json: ${ctx.state.includedStudiesArtifactId}\n- evidence_table.json: ${ctx.state.evidenceArtifactId}\n- contradiction_detection.json: ${ctx.state.contradictionArtifactId}\n- citation_verification.json: ${citationVerificationArtifactId}\n- bibtex.bib: ${bibtexArtifactId}\n- prisma_flow.json: ${prismaFlowArtifactId}\n- review_findings.json: ${reviewFindings.id}\n` });
         await ctx.recordProvenance({
           nodes: [
@@ -1419,7 +1424,7 @@ function renderSynthesis(question: string, papers: PaperHit[], rows: any[], qual
     const q = quality.find((x) => x.paperId === p.id);
     return `| ${p.title.replace(/\|/g, " ")} | ${p.year ?? "n.d."} | ${p.venue ?? p.sourceDb} | ${q?.tier ?? "Tier 3"} | ${p.abstract ? p.abstract.slice(0, 120).replace(/\|/g, " ") : "Metadata-level relevance"} |`;
   }).join("\n");
-  return `# PRISMA-Style Literature Review: ${question}\n\n## PRISMA Flow\n\n- Records identified through database searching: ${prisma.recordsIdentifiedThroughDatabaseSearching}\n- Records identified through citation chaining: ${prisma.recordsIdentifiedThroughCitationChaining}\n- Records after deduplication: ${prisma.recordsAfterDeduplication}\n- Records screened: ${prisma.recordsScreened}\n- Records excluded during title/abstract screening: ${prisma.recordsExcludedTitleAbstract}\n- Full-text/abstract records assessed for eligibility: ${prisma.fullTextOrAbstractRecordsAssessed}\n- Records excluded at eligibility: ${prisma.recordsExcludedEligibility}\n- Studies included in synthesis: ${prisma.studiesIncludedInSynthesis}\n\n## Summary\n\nThis review searched registered scholarly databases, deduplicated records, screened title/abstract metadata against explicit criteria, assessed eligibility using available abstract/full metadata, assigned evidence quality tiers, verified citation metadata, and synthesized evidence rows into traceable findings.\n\n## Key Findings\n\n${claims || "- No included papers were available for synthesis."}\n\n## Contradictions & Conflicts\n\n${contradictions.length ? contradictions.map((c) => `- ${c.type}: ${c.explanation}`).join("\n") : "- No explicit contradictions detected by automated v0 scan."}\n\n## Evidence Matrix\n\n| Paper | Year | Venue | Quality Tier | Key Finding |\n|---|---:|---|---|---|\n${matrix || "| No included papers | | | | |"}\n\n## References\n\n${refs || "No verified references returned."}\n\n## Gaps & Opportunities\n\n- Full-text retrieval and section-level extraction should be added for stronger eligibility assessment.\n- Citation chaining is represented, but connector-level reference expansion should be broadened where APIs permit.\n- Manual expert review remains necessary before treating this as a formal systematic review.\n`;
+  return `# PRISMA-Style Literature Review: ${question}\n\n## PRISMA Flow\n\n- Records identified through database searching: ${prisma.recordsIdentifiedThroughDatabaseSearching}\n- Records identified through citation chaining: ${prisma.recordsIdentifiedThroughCitationChaining}\n- Citation-chain hints found but not promoted to screened records: ${prisma.citationChainHintsFound ?? 0}\n- Records after deduplication: ${prisma.recordsAfterDeduplication}\n- Records screened: ${prisma.recordsScreened}\n- Records excluded during title/abstract screening: ${prisma.recordsExcludedTitleAbstract}\n- Full-text/abstract records assessed for eligibility: ${prisma.fullTextOrAbstractRecordsAssessed}\n- Records excluded at eligibility: ${prisma.recordsExcludedEligibility}\n- Studies included in synthesis: ${prisma.studiesIncludedInSynthesis}\n\n## Summary\n\nThis review searched registered scholarly databases, deduplicated records, screened title/abstract metadata against explicit criteria, assessed eligibility using available abstract/full metadata, assigned evidence quality tiers, verified citation metadata, and synthesized evidence rows into traceable findings.\n\n## Key Findings\n\n${claims || "- No included papers were available for synthesis."}\n\n## Contradictions & Conflicts\n\n${contradictions.length ? contradictions.map((c) => `- ${c.type}: ${c.explanation}`).join("\n") : "- No explicit contradictions detected by automated v0 scan."}\n\n## Evidence Matrix\n\n| Paper | Year | Venue | Quality Tier | Key Finding |\n|---|---:|---|---|---|\n${matrix || "| No included papers | | | | |"}\n\n## References\n\n${refs || "No verified references returned."}\n\n## Gaps & Opportunities\n\n- Full-text retrieval and section-level extraction should be added for stronger eligibility assessment.\n- Citation chaining is represented, but connector-level reference expansion should be broadened where APIs permit.\n- Manual expert review remains necessary before treating this as a formal systematic review.\n`;
 }
 
 export const literaturePack: CapabilityPack = {
