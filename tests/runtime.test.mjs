@@ -589,6 +589,65 @@ test("literature research brief preferences are audited and enforced", async () 
   }
 });
 
+test("literature topic expansion uses facet anchors instead of institution-only matches", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-ai-infra-expansion",
+      name: "Fake AI Infra Expansion",
+      description: "Fake connector for topic expansion tests",
+      async search() {
+        return [
+          { id: "bytedance-training", title: "Robust LLM Training Infrastructure at ByteDance", authors: ["Seed Team"], year: 2025, venue: "arXiv", url: "https://example.test/bytedance", sourceDb: "fake-ai-infra-expansion", abstract: "This paper describes large-scale LLM training infrastructure, distributed training reliability, checkpointing, and GPU cluster operations at ByteDance." },
+          { id: "openai-agents", title: "Infrastructure for AI Agents", authors: ["OpenAI"], year: 2025, venue: "TMLR", doi: "10.0000/agents", url: "https://example.test/agents", sourceDb: "fake-ai-infra-expansion", abstract: "This paper discusses agent application infrastructure and product integration patterns at OpenAI." },
+          { id: "kv-serving", title: "KV Cache Scheduling for LLM Serving Systems", authors: ["A"], year: 2025, venue: "Test", doi: "10.0000/kv", url: "https://example.test/kv", sourceDb: "fake-ai-infra-expansion", abstract: "KV cache scheduling, continuous batching, and inference serving improve large language model serving systems." }
+        ];
+      }
+    });
+    const result = await runtime.run({
+      input: "AI-Infra的发展现状和未来趋势，关注Seed、DeepSeek、OpenAI",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-ai-infra-expansion"],
+        limit: 3,
+        researchBrief: {
+          topic: "AI-Infra的发展现状和未来趋势",
+          intent: "literature_review",
+          scope: { include: ["AI infrastructure", "distributed training", "inference serving"], exclude: [] },
+          focus: {
+            domains: ["distributed training", "inference serving", "KV cache", "GPU cluster reliability"],
+            institutions: ["Seed", "ByteDance", "DeepSeek", "OpenAI"]
+          },
+          sources: { databases: ["fake-ai-infra-expansion"], preferred_sources: [], exclude_sources: [], date_range: { from: 2020, to: 2026 } },
+          evidence: { requireAbstract: true, minQuality: "Tier 3" },
+          output: { language: "zh", max_papers: 10 }
+        },
+        topicProfile: {
+          topicLabel: "AI-Infra",
+          coreTerms: ["AI infrastructure", "AI Infra"],
+          domainTerms: ["distributed training", "inference serving", "KV cache", "ByteDance", "OpenAI"],
+          modifierTerms: ["trend", "review"]
+        }
+      }
+    });
+    assert.equal(result.status, "completed");
+    const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
+    const parsed = artifacts.map((artifact) => {
+      try { return JSON.parse(artifact.text); } catch { return null; }
+    }).filter(Boolean);
+    const expansion = parsed.find((item) => item.stage === "topic_expansion");
+    const screening = parsed.find((item) => item.stage === "screening_log");
+    assert.ok(expansion.facets.some((facet) => facet.terms.includes("distributed training")));
+    assert.equal(screening.decisions.find((d) => d.paperId === "bytedance-training").decision, "include");
+    assert.equal(screening.decisions.find((d) => d.paperId === "kv-serving").decision, "include");
+    assert.equal(screening.decisions.find((d) => d.paperId === "openai-agents").decision, "exclude");
+  } finally {
+    await cleanup();
+  }
+});
+
 test("stage contract retries a failed stage with verifier feedback", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {

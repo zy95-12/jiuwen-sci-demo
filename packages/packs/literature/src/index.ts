@@ -864,17 +864,22 @@ export const literatureReviewStageContract: StageContractDefinition = {
           const agentDbs = normalizeLiteratureDatabaseIds(agentProtocol.databases, registry);
           const queryDbs = normalizeLiteratureDatabaseIds(selectedQueryDbs(agentQueries), registry);
           const dbs = metadataDbs.length ? metadataDbs : agentDbs.length ? agentDbs : queryDbs.length ? queryDbs : ["openalex"];
-          const topicProfile = topicProfileFromQueries(agentQueries, ctx.input, ctx.metadata.topicProfile);
-          return { artifactIds: briefArtifact ? [briefArtifact.id] : [], statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile, researchBriefArtifactId: briefArtifact?.id } };
+          const topicExpansion = normalizeTopicExpansion(agentQueries.topicExpansion ?? agentQueries.topic_expansion, ctx.input, ctx.metadata, agentQueries);
+          const executableQueryPlan = executableQueryPlanFrom(agentQueries, dbs, topicExpansion);
+          const topicProfile = topicProfileFromQueries(executableQueryPlan, ctx.input, ctx.metadata.topicProfile, topicExpansion);
+          const expansionArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(topicExpansion, null, 2) });
+          return { artifactIds: [briefArtifact?.id, expansionArtifact.id].filter(Boolean) as string[], statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: executableQueryPlan, topicProfile, topicExpansion, researchBriefArtifactId: briefArtifact?.id, topicExpansionArtifactId: expansionArtifact.id } };
         }
         const limit = Number(ctx.metadata.limit ?? 25);
         const dbs = metadataDbs.length ? metadataDbs : ["openalex", "semantic-scholar", "crossref"];
         const criteria = defaultCriteria();
-        const queryPlan = buildQueryPlan(ctx.input, dbs, criteria, ctx.metadata.topicProfile);
+        const topicExpansion = normalizeTopicExpansion(undefined, ctx.input, ctx.metadata);
+        const queryPlan = buildQueryPlan(ctx.input, dbs, criteria, ctx.metadata.topicProfile, topicExpansion);
         const briefArtifact = await ensureResearchBriefArtifact(ctx);
+        const expansionArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(topicExpansion, null, 2) });
         const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, appliedPreferences: protocolPreferenceSummary(ctx.metadata), workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
         const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(queryPlan, null, 2) });
-        return { artifactIds: [briefArtifact?.id, protocol.id, queries.id].filter(Boolean) as string[], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan, ctx.input, ctx.metadata.topicProfile), researchBriefArtifactId: briefArtifact?.id, protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
+        return { artifactIds: [briefArtifact?.id, expansionArtifact.id, protocol.id, queries.id].filter(Boolean) as string[], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan, ctx.input, ctx.metadata.topicProfile, topicExpansion), topicExpansion, researchBriefArtifactId: briefArtifact?.id, topicExpansionArtifactId: expansionArtifact.id, protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
       }
     },
     {
@@ -911,20 +916,23 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const searchCounts: Record<string, number> = {};
         const sourceErrors: any[] = [];
         const queryPlan = ctx.state.queryPlan as any;
+        const topicExpansion = (ctx.state.topicExpansion as TopicExpansion | undefined) ?? normalizeTopicExpansion(queryPlan?.topicExpansion ?? queryPlan?.topic_expansion, ctx.input, ctx.metadata, queryPlan);
         const selectedQueries = normalizeSelectedQueries(queryPlan).map((query) => ({
           ...query,
           database: normalizeLiteratureDatabaseIds(query.database, registry)[0] ?? query.database
         }));
         for (const db of dbs) {
-          const querySpec = selectedQueries.find((q: any) => q.database === db);
-          const queries = uniqueQueries([querySpec?.query ?? ctx.input, ...(querySpec?.fallbackQueries ?? []), ...dbFallbackQueries(db, ctx.input, ctx.state.topicProfile as TopicProfile | undefined)]);
-          const { out, artifactIds, errors } = await searchWithFallback(ctx, db, queries, limit);
-          allPapers.push(...(out.results ?? []));
-          searchCounts[db] = out.count ?? 0;
-          sourceErrors.push(...errors);
-          if (out.ok === false && !errors.includes(out)) sourceErrors.push(out);
-          else if (out.error) sourceErrors.push({ db, error: out.error });
-          searchArtifactIds.push(...artifactIds);
+          const queryGroups = searchQueryGroupsForDb(db, selectedQueries, topicExpansion, ctx.state.topicProfile as TopicProfile | undefined).slice(0, 5);
+          searchCounts[db] = 0;
+          for (const group of queryGroups) {
+            const { out, artifactIds, errors } = await searchWithFallback(ctx, db, group, Math.max(5, Math.ceil(limit / Math.max(1, queryGroups.length))));
+            allPapers.push(...(out.results ?? []));
+            searchCounts[db] += out.count ?? 0;
+            sourceErrors.push(...errors);
+            if (out.ok === false && !errors.includes(out)) sourceErrors.push(out);
+            else if (out.error) sourceErrors.push({ db, error: out.error });
+            searchArtifactIds.push(...artifactIds);
+          }
         }
         const chain = await ctx.tool({ toolId: "citation_chain", input: { papers: allPapers.slice(0, 5), limit: 5 } });
         const citationChainArtifactId = (chain.output as any).artifactId as string;
@@ -932,7 +940,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const citationChainHintsFound = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
         const recordsIdentifiedThroughCitationChaining = 0;
         if (Array.isArray((chain.output as any).errors)) sourceErrors.push(...(chain.output as any).errors);
-        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, appliedPreferences: protocolPreferenceSummary(ctx.metadata), recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, topicExpansionId: ctx.state.topicExpansionArtifactId, appliedPreferences: protocolPreferenceSummary(ctx.metadata), recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
         const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
         const deduped = (dedupe.output as any).papers as PaperHit[];
         const duplicates = (dedupe.output as any).duplicates ?? [];
@@ -963,14 +971,15 @@ export const literatureReviewStageContract: StageContractDefinition = {
       run: async (ctx) => {
         const deduped = (ctx.state.deduped as PaperHit[]) ?? [];
         const agentScreening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
-        const agentScreeningHasPreferences = !hasResearchBrief(ctx.metadata) || agentScreening?.decisions?.every((d: any) => typeof d.preferenceScore === "number");
-        if (agentScreening?.decisions && agentScreeningHasPreferences) {
+        const agentScreeningHasScaffold = agentScreening?.decisions?.every((d: any) => typeof d.preferenceScore === "number" && Array.isArray(d.briefTrace) && typeof d.hardExcluded === "boolean");
+        if (agentScreening?.decisions && agentScreeningHasScaffold) {
           const screeningDecisions = agentScreening.decisions;
           const screenedIn = screeningDecisions.filter((d: any) => d.decision === "include").map((d: any) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
           return { statePatch: { screeningDecisions, screenedIn } };
         }
         const criteria = ctx.state.criteria ?? defaultCriteria();
-        const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan, ctx.input, ctx.metadata.topicProfile);
+        const topicExpansion = (ctx.state.topicExpansion as TopicExpansion | undefined) ?? normalizeTopicExpansion((ctx.state.queryPlan as any)?.topicExpansion, ctx.input, ctx.metadata, ctx.state.queryPlan);
+        const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan, ctx.input, ctx.metadata.topicProfile, topicExpansion);
         const preferenceScores = deduped.map((paper) => scorePaperAgainstBrief(paper, ctx.metadata, topicProfile));
         const scoresById = new Map(preferenceScores.map((score) => [score.paperId, score]));
         const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper, topicProfile, scoresById.get(paper.id)));
@@ -1230,9 +1239,11 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
       const coreTerms = termsOf(queries?.coreTerms);
       const selectedQueries = normalizeSelectedQueries(queries);
-      const conceptTerms = Array.isArray(queries?.concepts) ? queries.concepts.flatMap((concept: any) => [concept.name, concept.label, ...(concept.synonyms ?? [])]).filter(Boolean) : [];
-      const hasDefinition = Boolean(queries?.conceptDefinition?.definition || queries?.concept_definition?.definition || conceptTerms.length);
-      const hasCore = coreTerms.length >= 3 || termsOf(conceptTerms).length >= 3;
+      const conceptTerms = conceptTermsOf(queries?.concepts);
+      const expansion = normalizeTopicExpansion(queries?.topicExpansion ?? queries?.topic_expansion, getQuestion(queries) ?? "", {}, queries);
+      const expansionTerms = uniqueQueries([...expansion.macroTerms, ...expansion.facets.flatMap((facet) => [...facet.requiredTerms, ...facet.terms])]);
+      const hasDefinition = Boolean(queries?.conceptDefinition?.definition || queries?.concept_definition?.definition || conceptTerms.length || expansion.facets.length);
+      const hasCore = coreTerms.length >= 3 || termsOf(conceptTerms).length >= 3 || expansionTerms.length >= 3;
       const hasUsableQuery = selectedQueries.some((q: any) => String(q.query ?? "").trim().length >= 3);
       const rawQuestion = getQuestion(queries);
       const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(rawQuestion ?? "")));
@@ -1271,7 +1282,9 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       const dedupe = await readStageArtifact(ctx.services, ctx.artifactIds, "deduplication");
       const screening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
       const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
-      const topicProfile = topicProfileFromQueries(queries);
+      const expansion = await readStageArtifact(ctx.services, ctx.artifactIds, "topic_expansion");
+      const brief = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+      const topicProfile = topicProfileFromQueries(queries, brief?.researchQuestion ?? "", brief?.compiledMetadata?.topicProfile, expansion);
       const papers: PaperHit[] = dedupe?.deduped ?? [];
       const decisions = screening?.decisions ?? [];
       const included = decisions.filter((d: any) => d.decision === "include");
@@ -1437,13 +1450,14 @@ function databaseKey(value: string): string {
   return value.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string; fallbackQueries?: string[] }[] {
+function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string; fallbackQueries?: string[]; facetId?: string }[] {
   const raw = value?.selectedQueries ?? value?.selected_queries ?? value?.queries ?? [];
   if (!Array.isArray(raw)) return [];
   return raw.map((query: any) => ({
     database: query?.database ?? query?.db ?? query?.source,
     query: query?.query ?? query?.queryString ?? query?.query_string,
     rationale: query?.rationale ?? query?.query_logic,
+    facetId: query?.facetId ?? query?.facet_id,
     fallbackQueries: Array.isArray(query?.fallbackQueries ?? query?.fallback_queries) ? (query.fallbackQueries ?? query.fallback_queries).map(String) : undefined
   })).filter((query) => query.database || query.query);
 }
@@ -1486,6 +1500,27 @@ type TopicProfile = {
   coreTerms: string[];
   domainTerms: string[];
   modifierTerms: string[];
+  expansion?: TopicExpansion;
+};
+
+type TopicFacet = {
+  id: string;
+  label: string;
+  weight: number;
+  terms: string[];
+  requiredTerms: string[];
+  anchorPolicy: "macro_or_facet" | "facet_plus_system" | "institution_plus_facet";
+};
+
+type TopicExpansion = {
+  stage: "topic_expansion";
+  macroConcept: string;
+  macroTerms: string[];
+  systemTerms: string[];
+  institutionTerms: string[];
+  facets: TopicFacet[];
+  excludeTerms: string[];
+  audit: { source: string; generatedAt?: string };
 };
 
 type PreferenceScore = {
@@ -1511,8 +1546,9 @@ type PreferenceScore = {
   };
 };
 
-function buildQueryPlan(question: string, dbs: string[], criteria: unknown, metadataProfile?: unknown): any {
+function buildQueryPlan(question: string, dbs: string[], criteria: unknown, metadataProfile?: unknown, expansion?: TopicExpansion): any {
   const topicProfile = topicProfileFromMetadata(metadataProfile, question);
+  const topicExpansion = expansion ?? normalizeTopicExpansion(undefined, question, { topicProfile: metadataProfile });
   const broadQuery = booleanOr(topicProfile.coreTerms);
   const trendQuery = `${broadQuery} AND (review OR survey OR roadmap OR trend OR "current status" OR "future directions")`;
   const domainQuery = booleanOr(topicProfile.domainTerms);
@@ -1528,8 +1564,9 @@ function buildQueryPlan(question: string, dbs: string[], criteria: unknown, meta
     coreTerms: topicProfile.coreTerms,
     domainTerms: topicProfile.domainTerms,
     modifierTerms: topicProfile.modifierTerms,
+    topicExpansion,
     criteria,
-    selectedQueries: dbs.map((db) => databaseSearchQuery(db, trendQuery, domainQuery, topicProfile)),
+    selectedQueries: executableQueriesFromExpansion(dbs, topicExpansion, topicProfile),
     alternativeQueries: dbs.flatMap((db) => [
       { database: db, query: broadQuery, rationale: "High-precision core concept query." },
       { database: db, query: domainQuery, rationale: "Domain-expansion query from the runtime topic profile." }
@@ -1537,29 +1574,63 @@ function buildQueryPlan(question: string, dbs: string[], criteria: unknown, meta
   };
 }
 
-function databaseSearchQuery(db: string, trendQuery: string, domainQuery: string, topicProfile: TopicProfile): any {
-  const fallbackQueries = dbFallbackQueries(db, topicProfile.topicLabel ?? "", topicProfile);
-  if (db === "arxiv") {
-    return {
-      database: db,
-      query: booleanOr(topicProfile.coreTerms.slice(0, 2)),
-      fallbackQueries,
-      rationale: "arXiv API is more reliable with short technical queries; use fallback queries for recall instead of one long Boolean expression."
-    };
-  }
+function executableQueryPlanFrom(queryPlan: any, dbs: string[], expansion: TopicExpansion): any {
+  const selected = normalizeSelectedQueries(queryPlan);
+  const executable = selected.filter((query) => dbs.includes(String(query.database)));
+  const topicProfile = topicProfileFromQueries(queryPlan, getQuestion(queryPlan) ?? "", undefined, expansion);
   return {
-    database: db,
-    query: domainQuery ? `${trendQuery} OR ${domainQuery}` : trendQuery,
-    fallbackQueries,
-    rationale: "Expanded query with core concept anchors, domain terms, and trend/review modifiers."
+    ...queryPlan,
+    stage: "queries",
+    topicExpansion: expansion,
+    selectedQueries: executable.length ? executable : executableQueriesFromExpansion(dbs, expansion, topicProfile)
   };
+}
+
+function executableQueriesFromExpansion(dbs: string[], expansion: TopicExpansion, topicProfile: TopicProfile): any[] {
+  const facets = expansion.facets.length ? expansion.facets : [coreFacetFromExpansion(expansion, topicProfile)];
+  return dbs.flatMap((db) => facets.slice(0, 8).map((facet) => ({
+    database: db,
+    facetId: facet.id,
+    query: queryForFacet(db, expansion, facet),
+    fallbackQueries: fallbackQueriesForFacet(db, expansion, facet),
+    rationale: `Facet query for ${facet.label}; generated from topic_expansion.json and executable connector ${db}.`
+  })));
+}
+
+function coreFacetFromExpansion(expansion: TopicExpansion, topicProfile: TopicProfile): TopicFacet {
+  const terms = uniqueQueries([...expansion.macroTerms, ...topicProfile.coreTerms]).slice(0, 8);
+  return { id: "core", label: "Core topic", weight: 1, terms, requiredTerms: terms.slice(0, 3), anchorPolicy: "macro_or_facet" };
+}
+
+function queryForFacet(db: string, expansion: TopicExpansion, facet: TopicFacet): string {
+  const macro = booleanOr(expansion.macroTerms.slice(0, db === "arxiv" ? 2 : 4));
+  const facetTerms = booleanOr(uniqueQueries([...facet.requiredTerms, ...facet.terms]).slice(0, db === "arxiv" ? 3 : 6));
+  const system = booleanOr(expansion.systemTerms.slice(0, db === "arxiv" ? 2 : 4));
+  const institutions = booleanOr(expansion.institutionTerms.slice(0, db === "arxiv" ? 2 : 6));
+  if (db === "crossref") return facetTerms || macro || system;
+  if (db === "arxiv") return uniqueQueries([facetTerms, system, institutions].filter(Boolean)).join(" OR ");
+  return uniqueQueries([
+    macro && facetTerms ? `(${macro}) AND (${facetTerms})` : facetTerms || macro,
+    system && facetTerms ? `(${system}) AND (${facetTerms})` : "",
+    institutions && facetTerms ? `(${institutions}) AND (${facetTerms})` : ""
+  ]).filter(Boolean).join(" OR ");
+}
+
+function fallbackQueriesForFacet(db: string, expansion: TopicExpansion, facet: TopicFacet): string[] {
+  const seeds = db === "crossref"
+    ? [...facet.requiredTerms, ...facet.terms].slice(0, 3)
+    : [...facet.requiredTerms, ...facet.terms, ...expansion.macroTerms, ...expansion.systemTerms].slice(0, 5);
+  return uniqueQueries(seeds.map(quoteQueryTerm));
 }
 
 function dbFallbackQueries(db: string, question = "", profile?: TopicProfile): string[] {
   const topicProfile = profile ?? topicProfileFromMetadata(undefined, question);
-  const seeds = db === "arxiv"
-    ? [...topicProfile.coreTerms.slice(0, 3), ...topicProfile.domainTerms.slice(0, 2)]
-    : topicProfile.coreTerms.slice(0, 3);
+  const expansion = topicProfile.expansion;
+  const seeds = expansion
+    ? [...expansion.facets.flatMap((facet) => facet.requiredTerms.length ? facet.requiredTerms : facet.terms).slice(0, 5), ...expansion.macroTerms.slice(0, 2)]
+    : db === "arxiv"
+      ? [...topicProfile.coreTerms.slice(0, 3), ...topicProfile.domainTerms.slice(0, 2)]
+      : topicProfile.coreTerms.slice(0, 3);
   return uniqueQueries(seeds.map(quoteQueryTerm));
 }
 
@@ -1575,28 +1646,32 @@ function arxivTerms(query: string): string[] {
   return [...new Set([...quoted, ...fallback].map((term) => term.trim()).filter(Boolean))].slice(0, 3);
 }
 
-function topicProfileFromMetadata(value: unknown, question: string): TopicProfile {
+function topicProfileFromMetadata(value: unknown, question: string, expansion?: TopicExpansion): TopicProfile {
   const profile = value && typeof value === "object" ? value as any : {};
   const coreTerms = termsOf(profile.coreTerms ?? profile.core_terms);
   const domainTerms = termsOf(profile.domainTerms ?? profile.domain_terms);
   const modifierTerms = termsOf(profile.modifierTerms ?? profile.modifier_terms);
   const extracted = extractSearchTerms(question);
+  const topicExpansion = expansion ?? (profile.expansion as TopicExpansion | undefined);
   return {
     topicLabel: typeof profile.topicLabel === "string" ? profile.topicLabel : question,
-    coreTerms: coreTerms.length ? coreTerms : extracted,
-    domainTerms,
-    modifierTerms: modifierTerms.length ? modifierTerms : defaultModifierTerms()
+    coreTerms: uniqueQueries([...(coreTerms.length ? coreTerms : extracted), ...(topicExpansion?.macroTerms ?? [])]),
+    domainTerms: uniqueQueries([...domainTerms, ...(topicExpansion?.facets.flatMap((facet) => [...facet.requiredTerms, ...facet.terms]) ?? [])]),
+    modifierTerms: modifierTerms.length ? modifierTerms : defaultModifierTerms(),
+    expansion: topicExpansion
   };
 }
 
-function topicProfileFromQueries(queries: any, question = "", metadataProfile?: unknown): TopicProfile {
-  const fallback = topicProfileFromMetadata(metadataProfile, question);
+function topicProfileFromQueries(queries: any, question = "", metadataProfile?: unknown, expansion?: TopicExpansion): TopicProfile {
+  const topicExpansion = expansion ?? normalizeTopicExpansion(queries?.topicExpansion ?? queries?.topic_expansion, question, { topicProfile: metadataProfile }, queries);
+  const fallback = topicProfileFromMetadata(metadataProfile, question, topicExpansion);
   const conceptTerms = conceptTermsOf(queries?.concepts);
   return {
     topicLabel: queries?.researchQuestion ?? queries?.question ?? fallback.topicLabel,
-    coreTerms: termsOf(queries?.coreTerms).length ? termsOf(queries?.coreTerms) : conceptTerms.length ? conceptTerms : fallback.coreTerms,
-    domainTerms: termsOf(queries?.domainTerms).length ? termsOf(queries?.domainTerms) : fallback.domainTerms,
-    modifierTerms: termsOf(queries?.modifierTerms).length ? termsOf(queries?.modifierTerms) : fallback.modifierTerms
+    coreTerms: uniqueQueries([...(termsOf(queries?.coreTerms).length ? termsOf(queries?.coreTerms) : conceptTerms.length ? conceptTerms : fallback.coreTerms), ...topicExpansion.macroTerms]),
+    domainTerms: uniqueQueries([...(termsOf(queries?.domainTerms).length ? termsOf(queries?.domainTerms) : fallback.domainTerms), ...topicExpansion.facets.flatMap((facet) => [...facet.requiredTerms, ...facet.terms])]),
+    modifierTerms: termsOf(queries?.modifierTerms).length ? termsOf(queries?.modifierTerms) : fallback.modifierTerms,
+    expansion: topicExpansion
   };
 }
 
@@ -1610,12 +1685,21 @@ function conceptTermsOf(value: unknown): string[] {
     concept?.name,
     concept?.label,
     concept?.term,
-    ...(Array.isArray(concept?.synonyms) ? concept.synonyms : [])
+    ...(Array.isArray(concept?.synonyms) ? concept.synonyms : []),
+    ...(Array.isArray(concept?.keywords) ? concept.keywords : []),
+    ...(Array.isArray(concept?.terms) ? concept.terms : [])
   ]));
 }
 
 function defaultModifierTerms(): string[] {
   return ["development status", "current status", "trend", "trends", "future direction", "future directions", "roadmap", "review", "survey", "现状", "趋势", "发展"];
+}
+
+function isModifierOnlyTerm(term: string): boolean {
+  const normalized = normalizeText(term);
+  if (defaultModifierTerms().map(normalizeText).includes(normalized)) return true;
+  const compact = term.replace(/\s+/g, "");
+  return /^[现状趋势发展当前未来方向综述]+$/.test(compact);
 }
 
 function extractSearchTerms(value: string): string[] {
@@ -1630,7 +1714,7 @@ function extractSearchTerms(value: string): string[] {
     .replace(/[A-Za-z0-9"()]/g, " ")
     .split(/[\s,;，；:：的和与及、]+/)
     .map((part) => part.trim())
-    .filter((part) => part.length >= 2 && !defaultModifierTerms().includes(part));
+    .filter((part) => part.length >= 2 && !isModifierOnlyTerm(part));
   const whole = value.trim() ? [value.trim()] : [];
   return uniqueQueries([...quoted, ...acronyms, ...englishPhrases, ...chinese, ...whole]).slice(0, 8);
 }
@@ -1648,7 +1732,7 @@ function normalizeText(value: string): string {
 }
 
 function selectedQueryDbs(queries: any): string[] {
-  const selected = Array.isArray(queries?.selectedQueries) ? queries.selectedQueries : [];
+  const selected = queries?.selectedQueries ?? queries?.selected_queries ?? [];
   return selected.map((q: any) => q.database).filter((db: unknown): db is string => typeof db === "string" && db.length > 0);
 }
 
@@ -1666,13 +1750,130 @@ function inferConcepts(question: string, profile?: TopicProfile): any[] {
   return topicProfile.coreTerms.slice(0, 10).map((name, index) => ({ name, synonyms: [], required: index === 0 }));
 }
 
+function normalizeTopicExpansion(value: any, question: string, metadata: any = {}, queries?: any): TopicExpansion {
+  const raw = value && typeof value === "object" ? value : {};
+  const metadataProfile = metadata?.topicProfile ?? {};
+  const brief = metadata?.researchBrief ?? {};
+  const queryConceptTerms = conceptTermsOf(queries?.concepts);
+  const macroTerms = uniqueQueries([
+    raw.macroConcept,
+    raw.macro_concept,
+    raw.macro,
+    metadataProfile.topicLabel,
+    question,
+    ...termsOf(raw.macroTerms ?? raw.macro_terms),
+    ...termsOf(metadataProfile.coreTerms ?? metadataProfile.core_terms),
+    ...termsOf(brief?.scope?.include),
+    ...queryConceptTerms.slice(0, 12),
+    ...extractSearchTerms(question)
+  ]).filter((term) => !isModifierOnlyTerm(term));
+  const systemTerms = uniqueQueries([
+    "infrastructure",
+    "system",
+    "systems",
+    "platform",
+    "framework",
+    "engine",
+    "cluster",
+    "serving",
+    "training",
+    "inference",
+    ...termsOf(raw.systemTerms ?? raw.system_terms)
+  ]);
+  const institutionTerms = uniqueQueries([
+    ...termsOf(raw.institutionTerms ?? raw.institution_terms),
+    ...termsOf(metadata?.sourcePreferences?.institutions),
+    ...termsOf(brief?.focus?.institutions)
+  ]);
+  const rawFacets = Array.isArray(raw.facets) ? raw.facets : [];
+  const hasStructuredExpansion = rawFacets.length > 0 || Boolean(metadata?.researchBrief) || Array.isArray(queries?.concepts);
+  const geographyTerms = termsOf(metadata?.sourcePreferences?.geographies);
+  const blockedFacetSeeds = new Set([...institutionTerms, ...geographyTerms].map(normalizeText));
+  const metadataFacetSeeds = [
+    ...(metadata?.researchBrief ? termsOf(metadataProfile.domainTerms ?? metadataProfile.domain_terms) : []),
+    ...termsOf(brief?.focus?.domains),
+    ...queryConceptTerms.slice(12)
+  ].filter((term) => !blockedFacetSeeds.has(normalizeText(term)));
+  const facets = uniqueFacets([
+    ...rawFacets.map((facet: any, index: number) => normalizeFacet(facet, index)),
+    ...metadataFacetSeeds.map((term, index) => normalizeFacet({ id: slugify(term), label: term, terms: [term], requiredTerms: [term] }, index + rawFacets.length))
+  ]);
+  const fallbackFacet = normalizeFacet({ id: "core", label: "Core topic", terms: macroTerms.slice(0, 6), requiredTerms: macroTerms.slice(0, 3), anchorPolicy: "macro_or_facet" }, 0);
+  return {
+    stage: "topic_expansion",
+    macroConcept: String(raw.macroConcept ?? raw.macro_concept ?? metadataProfile.topicLabel ?? question),
+    macroTerms: macroTerms.length ? macroTerms : extractSearchTerms(question),
+    systemTerms,
+    institutionTerms,
+    facets: hasStructuredExpansion ? facets.length ? facets : [fallbackFacet] : [],
+    excludeTerms: uniqueQueries([...termsOf(raw.excludeTerms ?? raw.exclude_terms), ...termsOf(metadata?.exclusionCriteria), ...termsOf(brief?.scope?.exclude)]),
+    audit: { source: raw.stage === "topic_expansion" ? "artifact" : rawFacets.length ? "agent_or_metadata" : "deterministic_fallback" }
+  };
+}
+
+function normalizeFacet(facet: any, index: number): TopicFacet {
+  const label = String(facet?.label ?? facet?.name ?? facet?.id ?? `facet_${index + 1}`);
+  const terms = uniqueQueries([
+    ...termsOf(facet?.terms),
+    ...termsOf(facet?.keywords),
+    ...termsOf(facet?.synonyms),
+    label
+  ]);
+  const requiredTerms = uniqueQueries([...termsOf(facet?.requiredTerms ?? facet?.required_terms), ...terms.slice(0, 2)]);
+  const policy = ["macro_or_facet", "facet_plus_system", "institution_plus_facet"].includes(facet?.anchorPolicy ?? facet?.anchor_policy)
+    ? facet.anchorPolicy ?? facet.anchor_policy
+    : "facet_plus_system";
+  return {
+    id: slugify(String(facet?.id ?? label)) || `facet_${index + 1}`,
+    label,
+    weight: Number(facet?.weight ?? 1),
+    terms,
+    requiredTerms,
+    anchorPolicy: policy as TopicFacet["anchorPolicy"]
+  };
+}
+
+function uniqueFacets(facets: TopicFacet[]): TopicFacet[] {
+  const byId = new Map<string, TopicFacet>();
+  for (const facet of facets) {
+    const existing = byId.get(facet.id);
+    if (!existing) byId.set(facet.id, facet);
+    else byId.set(facet.id, { ...existing, terms: uniqueQueries([...existing.terms, ...facet.terms]), requiredTerms: uniqueQueries([...existing.requiredTerms, ...facet.requiredTerms]), weight: Math.max(existing.weight, facet.weight) });
+  }
+  return [...byId.values()].filter((facet) => facet.terms.length || facet.requiredTerms.length).slice(0, 24);
+}
+
+function slugify(value: string): string {
+  return normalizeText(value).replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
+}
+
+function searchQueryGroupsForDb(db: string, selectedQueries: { database?: string; query?: string; fallbackQueries?: string[] }[], expansion: TopicExpansion, profile?: TopicProfile): string[][] {
+  const selected = selectedQueries.filter((query) => query.database === db && query.query).map((query) => uniqueQueries([query.query, ...(query.fallbackQueries ?? [])]));
+  if (selected.length) return selected;
+  const topicProfile = profile ?? topicProfileFromMetadata(undefined, expansion.macroConcept, expansion);
+  return executableQueriesFromExpansion([db], expansion, topicProfile).map((query) => uniqueQueries([query.query, ...(query.fallbackQueries ?? [])]));
+}
+
 function topicAnchorScore(paper: PaperHit, profile: TopicProfile): { anchored: boolean; score: number; coreHits: string[]; domainHits: string[]; modifierHits: string[] } {
   const haystack = normalizeText(`${paper.title} ${paper.abstract ?? ""} ${paper.venue ?? ""}`);
   const coreHits = profile.coreTerms.filter((term) => haystack.includes(normalizeText(term)));
-  const domainHits = profile.domainTerms.filter((term) => haystack.includes(normalizeText(term)));
   const modifierHits = profile.modifierTerms.filter((term) => haystack.includes(normalizeText(term)));
-  const anchored = coreHits.length > 0 || (domainHits.length > 0 && /\b(ai|artificial intelligence|machine learning|deep learning|foundation model|neural network)\b/i.test(haystack));
-  const score = coreHits.length * 3 + domainHits.length * 1.5 + modifierHits.length * 0.2 + (paper.abstract ? 0.3 : 0) + (paper.doi || paper.url ? 0.1 : 0);
+  const expansion = profile.expansion;
+  const institutionKeys = new Set((expansion?.institutionTerms ?? []).map(normalizeText));
+  const domainHits = profile.domainTerms.filter((term) => !institutionKeys.has(normalizeText(term)) && haystack.includes(normalizeText(term)));
+  const facetHits = expansion ? expansion.facets.filter((facet) => matchedTerms(haystack, [...facet.requiredTerms, ...facet.terms]).length > 0) : [];
+  const systemHits = expansion ? matchedTerms(haystack, expansion.systemTerms) : [];
+  const institutionHits = expansion ? matchedTerms(haystack, expansion.institutionTerms) : [];
+  const hasMlContext = /\b(ai|artificial intelligence|machine learning|deep learning|foundation model|large language model|llm|neural network)\b/i.test(haystack);
+  const facetAnchored = facetHits.some((facet) =>
+    facet.anchorPolicy === "macro_or_facet"
+      || coreHits.length > 0
+      || systemHits.length > 0
+      || (facet.anchorPolicy === "institution_plus_facet" && institutionHits.length > 0)
+      || hasMlContext
+  );
+  const anchored = coreHits.length > 0 || facetAnchored || (domainHits.length > 0 && hasMlContext);
+  const score = coreHits.length * 3 + domainHits.length * 1.2 + facetHits.reduce((sum, facet) => sum + facet.weight * 1.8, 0) + systemHits.length * 0.6 + institutionHits.length * 0.4 + modifierHits.length * 0.2 + (paper.abstract ? 0.3 : 0) + (paper.doi || paper.url ? 0.1 : 0);
   return { anchored, score, coreHits, domainHits, modifierHits };
 }
 

@@ -112,15 +112,28 @@ CLI 的 `compileBriefMetadata` 会把用户 brief 转换成 runtime metadata：
 
 - `brief_metadata_valid`：如果存在 research brief artifact，必须包含调研问题、原始 brief 和编译后的 topic profile。
 
+同一阶段还会写出 `topic_expansion.json`。它把宽泛 topic 拆成可执行、可验证的结构化扩展：
+
+- `macroConcept` / `macroTerms`：用户问题中的上位概念。
+- `facets`：训练、推理、评测、系统组件等子方向。facet 来自 LLM 生成的 query concepts、Research Brief、或 deterministic fallback。
+- `systemTerms`：infrastructure、system、platform、training、serving 等系统语义词。
+- `institutionTerms`：用户关注的机构，只作为偏好加权和机构覆盖审计，不单独构成 topic anchor。
+- `excludeTerms`：用户声明的排除词。
+
+pack 不硬编码具体领域词。比如 AI-Infra 的 `distributed training`、`KV cache`、`RDMA`，应来自 brief、LLM 生成的 `concepts[].keywords`，或运行时 metadata。pack 只解析通用 schema，并把它保存为可审计 artifact。
+
 ### 3. Search Stage
 
 `search_dedupe` 使用 metadata 中的 `dbs`、`limit` 和 `topicProfile` 生成查询、fallback 查询和数据库计划。
+
+如果存在 `topic_expansion.json`，search 会按 facet 生成多路可执行查询，而不是只搜索原始大词。不可执行数据库名会被过滤或映射到当前已注册 connector，避免 agent 写出 Google Scholar、IEEE Xplore、ACM Digital Library 后实际无法执行。
 
 `identification.json` 会记录：
 
 - 每个数据源命中数量。
 - 数据源错误和 fallback 情况。
 - 本次检索应用的偏好摘要。
+- 本次使用的 topic expansion artifact id。
 
 ### 4. Screening Stage
 
@@ -140,6 +153,8 @@ CLI 的 `compileBriefMetadata` 会把用户 brief 转换成 runtime metadata：
 - `requireDoi` 为 true 但没有 DOI。
 - `requireAbstract` 为 true 但没有摘要。
 - 命中 `excludedSources`。
+
+topic anchor 使用同一份 `topic_expansion.json`。纳入条件不再只依赖上位词，例如 `AI Infrastructure`；也允许 “facet + system” 组合，例如 `LLM training + infrastructure`、`KV cache + serving systems`。但机构词不能单独触发纳入，`OpenAI`、`ByteDance` 等只会增加偏好分，仍需要命中 topic/facet/system anchor。
 
 `screening_log.json` 中每条 decision 会包含：
 
@@ -223,4 +238,3 @@ pack 只理解通用结构：
 - inclusion/exclusion criteria
 
 因此同一机制可以复用于实验设计、算法发现、代码调研等任务，只需要对应 pack 定义自己的偏好结构、评分函数和 verifier。
-
