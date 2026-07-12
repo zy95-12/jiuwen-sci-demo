@@ -651,13 +651,26 @@ test("literature topic expansion uses facet anchors instead of institution-only 
 test("stage contract retries a failed stage with verifier feedback", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {
+    const retryFeedback = [];
     runtime.services.verifierRegistry.register({
       id: "test_ready",
       description: "Pass only after the stage used verifier feedback.",
       async verify(ctx) {
         return ctx.state.ready === true
           ? { ok: true, message: "ready" }
-          : { ok: false, message: "not ready", severity: "major", category: "test" };
+          : {
+              ok: false,
+              message: "not ready",
+              severity: "major",
+              category: "test",
+              targetRef: "draft",
+              diagnostics: {
+                target: "draft artifact",
+                missing: ["draft.ready"],
+                found: ["draft.started"],
+                requiredFixes: ["Create a draft artifact with ready=true."]
+              }
+            };
       }
     });
     const contract = {
@@ -672,6 +685,7 @@ test("stage contract retries a failed stage with verifier feedback", async () =>
         verifiers: ["artifact_requirements_met", "test_ready"],
         retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
         run: async (ctx) => {
+          if (ctx.feedback.length) retryFeedback.push(...ctx.feedback);
           if (!ctx.feedback.length) return { statePatch: { ready: false } };
           const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "draft", fixed: true }) });
           return { artifactIds: [artifact.id], statePatch: { ready: true } };
@@ -690,8 +704,50 @@ test("stage contract retries a failed stage with verifier feedback", async () =>
     }
     assert.ok(stages.includes("draft"));
     assert.ok(stages.includes("verifier_report"));
+    assert.ok(retryFeedback.some((message) => message.includes("test_ready failed on draft")));
+    assert.ok(retryFeedback.some((message) => message.includes("Missing fields:\n  - draft.ready")));
+    assert.ok(retryFeedback.some((message) => message.includes("Required fixes:\n  - Create a draft artifact with ready=true.")));
+    const reports = [];
+    for (const id of result.artifactIds) {
+      try {
+        const parsed = JSON.parse((await runtime.services.artifactStore.read(id)).toString("utf8"));
+        if (parsed.stage === "verifier_report") reports.push(parsed);
+      } catch {}
+    }
+    assert.ok(reports.some((report) => report.deterministicChecks.some((check) => check.verifierId === "test_ready" && check.diagnostics?.missing?.includes("draft.ready"))));
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.failed" && event.stageId === "draft"));
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.completed" && event.stageId === "draft" && event.attempt === 2));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("literature query concept verifier returns structured diagnostics", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    const contract = runtime.services.packRegistry.getStageContract("literature-review-prisma-v1");
+    const stage = contract.stages.find((item) => item.id === "protocol_query");
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "AI4S", cwd: runtime.services.config.cwd });
+    const queries = await runtime.services.artifactStore.create({
+      sessionId: session.id,
+      createdBy: { sessionId: session.id, agentId: "test", toolId: "test" },
+      type: "json",
+      mediaType: "application/json",
+      content: JSON.stringify({
+        stage: "queries",
+        question: "AI4S",
+        selectedQueries: [{ database: "openalex", query: "AI4S" }],
+        conceptsCoverage: "AI4S includes AI for scientific discovery and scientific foundation models."
+      })
+    });
+    const verifier = runtime.services.verifierRegistry.get("literature_query_concepts_valid");
+    const result = await verifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds: [queries.id], state: {} });
+    assert.equal(result.ok, false);
+    assert.equal(result.targetRef, "queries");
+    assert.ok(result.diagnostics.missing.some((item) => item.includes("conceptDefinition")));
+    assert.ok(result.diagnostics.found.includes("queries.conceptsCoverage"));
+    assert.ok(result.diagnostics.requiredFixes.some((item) => item.includes("stage=\"queries\"")));
   } finally {
     await cleanup();
   }

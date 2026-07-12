@@ -1,7 +1,7 @@
 import { createInternalToolContext } from "./contexts.js";
 import { taskTool } from "./core-tools.js";
 import { RuntimeError } from "./errors.js";
-import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, renderStageAgentPrompt, resolveStageTransition } from "./stage-helpers.js";
+import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, formatVerifierFeedback, renderStageAgentPrompt, resolveStageTransition } from "./stage-helpers.js";
 import { ToolRuntime } from "./tool-runtime.js";
 import type {
   Artifact,
@@ -156,7 +156,7 @@ export class StageContractRunner {
       if (count < minCount) {
         const result = { verifierId: "required_artifact", hardGate: true, ok: false, message: `Missing required artifact for stage ${stage.id}: ${JSON.stringify(req)}`, severity: "blocking" as const, category: "missing_artifact" };
         deterministicResults.push(result);
-        messages.push(result.message);
+        messages.push(formatVerifierFeedback(result));
       }
     }
 
@@ -165,8 +165,8 @@ export class StageContractRunner {
       if (!verifier) throw new RuntimeError("VERIFIER_NOT_FOUND", policy.id);
       const result = await verifier.verify({ sessionId, services: this.services, contract, stage, artifactIds, state });
       deterministicResults.push({ ...result, verifierId: policy.id, hardGate: policy.hardGate === true });
-      messages.push(result.message);
       if (!result.ok) {
+        messages.push(formatVerifierFeedback({ ...result, verifierId: policy.id, hardGate: policy.hardGate === true }));
         const severity = result.severity ?? "major";
         const finding = await this.services.reviewStore.create({
           sessionId,
@@ -250,7 +250,8 @@ export class StageContractRunner {
         severity: result.severity,
         category: result.category,
         targetRef: result.targetRef,
-        message: result.message
+        message: result.message,
+        diagnostics: result.diagnostics
       })),
       messages: input.messages
     };

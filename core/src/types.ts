@@ -148,6 +148,15 @@ export type StageVerifierResult = {
   severity?: "blocking" | "high" | "major" | "minor" | "info";
   category?: string;
   targetRef?: string;
+  diagnostics?: {
+    target?: string;
+    missing?: string[];
+    invalid?: string[];
+    found?: string[];
+    requiredFixes?: string[];
+    hints?: string[];
+    details?: Record<string, unknown>;
+  };
 };
 
 export type StageVerifierContext = {

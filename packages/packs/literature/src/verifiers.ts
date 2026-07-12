@@ -43,7 +43,51 @@ export const literatureStageVerifiers: StageVerifierDefinition[] = [
       const rawQuestion = getQuestion(queries);
       const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(rawQuestion ?? "")));
       const ok = hasDefinition && hasCore && hasUsableQuery && notOnlyRawQuestion;
-      return ok ? { ok: true, message: "Query concept grounding and expansion are valid." } : { ok: false, message: "Query plan lacks concept grounding or expanded scholarly queries.", severity: "blocking", category: "query_concepts_invalid" };
+      if (ok) return { ok: true, message: "Query concept grounding and expansion are valid." };
+      const missing = [
+        !hasDefinition ? "queries.conceptDefinition.definition or structured concepts/topicExpansion facets" : "",
+        !hasCore ? "queries.coreTerms with at least 3 terms, or queries.concepts with at least 3 concept terms, or topicExpansion terms" : "",
+        !hasUsableQuery ? "queries.selectedQueries[].query" : "",
+        !notOnlyRawQuestion ? "expanded query text that is not only the raw research question" : ""
+      ].filter(Boolean);
+      const found = [
+        queries?.conceptsCoverage ? "queries.conceptsCoverage" : "",
+        queries?.concepts ? "queries.concepts" : "",
+        queries?.coreTerms ? "queries.coreTerms" : "",
+        queries?.topicExpansion || queries?.topic_expansion ? "queries.topicExpansion" : "",
+        selectedQueries.length ? "queries.selectedQueries" : "",
+        selectedQueries.some((query: any) => query.database) ? "queries.selectedQueries[].database" : "",
+        selectedQueries.some((query: any) => query.query) ? "queries.selectedQueries[].query" : ""
+      ].filter(Boolean);
+      return {
+        ok: false,
+        message: "Query plan lacks concept grounding or expanded scholarly queries.",
+        severity: "blocking",
+        category: "query_concepts_invalid",
+        targetRef: "queries",
+        diagnostics: {
+          target: "JSON artifact with stage=\"queries\"",
+          missing,
+          found,
+          requiredFixes: [
+            "Write a replacement JSON artifact with stage=\"queries\".",
+            "Provide conceptDefinition.definition explaining the scoped research concept.",
+            "Provide structured concepts and/or coreTerms; do not leave concept coverage only in prose.",
+            "Provide selectedQueries with database and expanded scholarly query strings."
+          ],
+          hints: [
+            "If conceptsCoverage exists, convert it into concepts/coreTerms/topicExpansion instead of leaving it as free text.",
+            "Use field names selectedQueries, conceptDefinition, concepts, coreTerms, and topicExpansion for the next attempt."
+          ],
+          details: {
+            selectedQueryCount: selectedQueries.length,
+            coreTermCount: coreTerms.length,
+            conceptTermCount: conceptTerms.length,
+            expansionTermCount: expansionTerms.length,
+            rawQuestion
+          }
+        }
+      };
     }
   },
   {

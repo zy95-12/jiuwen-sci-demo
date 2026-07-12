@@ -87,6 +87,19 @@ export function renderStageAgentPrompt(input: { contract: StageContractDefinitio
   ].filter(Boolean).join("\n\n");
 }
 
+export function formatVerifierFeedback(result: StageVerifierResult & { verifierId: string; hardGate?: boolean }): string {
+  const lines = [`${result.verifierId} failed${result.targetRef ? ` on ${result.targetRef}` : ""}: ${result.message}`];
+  const diagnostics = result.diagnostics;
+  if (!diagnostics) return lines[0];
+  if (diagnostics.target) lines.push(`Target: ${diagnostics.target}`);
+  if (diagnostics.missing?.length) lines.push(`Missing fields:\n${diagnostics.missing.map((item) => `  - ${item}`).join("\n")}`);
+  if (diagnostics.invalid?.length) lines.push(`Invalid fields:\n${diagnostics.invalid.map((item) => `  - ${item}`).join("\n")}`);
+  if (diagnostics.found?.length) lines.push(`Found usable fields:\n${diagnostics.found.map((item) => `  - ${item}`).join("\n")}`);
+  if (diagnostics.requiredFixes?.length) lines.push(`Required fixes:\n${diagnostics.requiredFixes.map((item) => `  - ${item}`).join("\n")}`);
+  if (diagnostics.hints?.length) lines.push(`Hints:\n${diagnostics.hints.map((item) => `  - ${item}`).join("\n")}`);
+  return lines.join("\n");
+}
+
 export async function createArtifactManifest(services: RuntimeServices, artifactIds: string[]): Promise<{ artifacts: { id: string; type: string; mediaType: string; stage?: string; role?: string; size: number; createdAt: string }[]; byStage: Record<string, string[]>; byRole: Record<string, string[]> }> {
   const artifacts = [];
   const byStage: Record<string, string[]> = {};
