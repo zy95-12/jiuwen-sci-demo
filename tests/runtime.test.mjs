@@ -260,6 +260,56 @@ test("literature PRISMA separates citation-chain hints from screened records", a
   }
 });
 
+test("literature protocol verifier prefers latest artifacts and accepts common field aliases", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    const contract = runtime.services.packRegistry.getStageContract("literature-review-prisma-v1");
+    const stage = contract.stages.find((item) => item.id === "protocol_query");
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "AI4S", cwd: runtime.services.config.cwd });
+    const oldProtocol = await runtime.services.artifactStore.create({
+      sessionId: session.id,
+      createdBy: { sessionId: session.id, agentId: "test", toolId: "test" },
+      type: "json",
+      mediaType: "application/json",
+      content: JSON.stringify({ stage: "protocol", databases: ["old"] })
+    });
+    const oldQueries = await runtime.services.artifactStore.create({
+      sessionId: session.id,
+      createdBy: { sessionId: session.id, agentId: "test", toolId: "test" },
+      type: "json",
+      mediaType: "application/json",
+      content: JSON.stringify({ stage: "queries", selectedQueries: [] })
+    });
+    const latestProtocol = await runtime.services.artifactStore.create({
+      sessionId: session.id,
+      createdBy: { sessionId: session.id, agentId: "test", toolId: "test" },
+      type: "json",
+      mediaType: "application/json",
+      content: JSON.stringify({ stage: "protocol", research_question: "AI4S status", databases: [{ name: "OpenAlex" }] })
+    });
+    const latestQueries = await runtime.services.artifactStore.create({
+      sessionId: session.id,
+      createdBy: { sessionId: session.id, agentId: "test", toolId: "test" },
+      type: "json",
+      mediaType: "application/json",
+      content: JSON.stringify({
+        stage: "queries",
+        question: "AI4S status",
+        concepts: [{ label: "AI for Science", synonyms: ["AI4S", "Artificial Intelligence for Science", "AI-driven scientific discovery"] }],
+        selected_queries: [{ database: "OpenAlex", query_string: "\"AI for Science\" OR \"AI-driven scientific discovery\" OR \"foundation models for science\"" }]
+      })
+    });
+    const artifactIds = [oldProtocol.id, oldQueries.id, latestProtocol.id, latestQueries.id];
+    const protocolVerifier = runtime.services.verifierRegistry.get("literature_protocol_valid");
+    const conceptVerifier = runtime.services.verifierRegistry.get("literature_query_concepts_valid");
+    assert.equal((await protocolVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
+    assert.equal((await conceptVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("registered pack workflow is selected for literature-like exec input", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {

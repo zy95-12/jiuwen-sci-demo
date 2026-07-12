@@ -1122,7 +1122,8 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
     async verify(ctx) {
       const protocol = await readStageArtifact(ctx.services, ctx.artifactIds, "protocol");
       const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
-      const ok = Boolean(protocol?.question && Array.isArray(protocol.databases) && protocol.databases.length && Array.isArray(queries?.selectedQueries) && queries.selectedQueries.length);
+      const selectedQueries = normalizeSelectedQueries(queries);
+      const ok = Boolean(getQuestion(protocol) && normalizeDatabases(protocol).length && selectedQueries.length && selectedQueries.every((q) => q.database && q.query));
       return ok ? { ok: true, message: "Protocol and query plan are valid." } : { ok: false, message: "Protocol or query plan is missing required question/database/query fields.", severity: "major", category: "protocol_invalid" };
     }
   },
@@ -1132,11 +1133,13 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
     async verify(ctx) {
       const queries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
       const coreTerms = termsOf(queries?.coreTerms);
-      const selectedQueries = Array.isArray(queries?.selectedQueries) ? queries.selectedQueries : [];
-      const hasDefinition = Boolean(queries?.conceptDefinition?.definition);
-      const hasCore = coreTerms.length >= 3;
+      const selectedQueries = normalizeSelectedQueries(queries);
+      const conceptTerms = Array.isArray(queries?.concepts) ? queries.concepts.flatMap((concept: any) => [concept.name, concept.label, ...(concept.synonyms ?? [])]).filter(Boolean) : [];
+      const hasDefinition = Boolean(queries?.conceptDefinition?.definition || queries?.concept_definition?.definition || conceptTerms.length);
+      const hasCore = coreTerms.length >= 3 || termsOf(conceptTerms).length >= 3;
       const hasExpandedEnglish = selectedQueries.some((q: any) => /AI for Science|Artificial Intelligence for Science|scientific discovery|foundation models for science/i.test(String(q.query ?? "")));
-      const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(queries?.researchQuestion ?? "")));
+      const rawQuestion = getQuestion(queries);
+      const notOnlyRawQuestion = selectedQueries.some((q: any) => normalizeText(String(q.query ?? "")) !== normalizeText(String(rawQuestion ?? "")));
       const ok = hasDefinition && hasCore && hasExpandedEnglish && notOnlyRawQuestion;
       return ok ? { ok: true, message: "Query concept grounding and expansion are valid." } : { ok: false, message: "Query plan lacks concept grounding, AI4S core terms, or expanded English scholarly queries.", severity: "blocking", category: "query_concepts_invalid" };
     }
@@ -1218,7 +1221,7 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
 ];
 
 async function readStageArtifact(services: RuntimeServices, artifactIds: string[], stage: string): Promise<any | null> {
-  for (const id of artifactIds) {
+  for (const id of [...artifactIds].reverse()) {
     const artifact = await services.artifactStore.get(id);
     if (!artifact || artifact.mediaType !== "application/json") continue;
     try {
@@ -1229,6 +1232,26 @@ async function readStageArtifact(services: RuntimeServices, artifactIds: string[
     }
   }
   return null;
+}
+
+function getQuestion(value: any): string | undefined {
+  return value?.question ?? value?.researchQuestion ?? value?.research_question;
+}
+
+function normalizeDatabases(value: any): string[] {
+  const databases = value?.databases ?? value?.databasePlan ?? value?.database_plan ?? [];
+  if (!Array.isArray(databases)) return [];
+  return databases.map((db: any) => typeof db === "string" ? db : (db?.id ?? db?.name ?? db?.database)).filter(Boolean).map(String);
+}
+
+function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string }[] {
+  const raw = value?.selectedQueries ?? value?.selected_queries ?? value?.queries ?? [];
+  if (!Array.isArray(raw)) return [];
+  return raw.map((query: any) => ({
+    database: query?.database ?? query?.db ?? query?.source,
+    query: query?.query ?? query?.queryString ?? query?.query_string,
+    rationale: query?.rationale ?? query?.query_logic
+  })).filter((query) => query.database || query.query);
 }
 
 type TopicProfile = {
