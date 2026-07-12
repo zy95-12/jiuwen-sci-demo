@@ -1,104 +1,174 @@
 # jiuwen-sci
 
-`jiuwen-sci` 是一个 CLI-first、local-first 的通用科研 Agent 平台。项目目标不是只做文献调研，而是提供一个可扩展的科研 Agent Runtime Kernel，让文献调研、实验设计、算法发现、代码编写、数据分析、论文写作等能力都能通过独立 capability pack 接入。
+`jiuwen-sci` 是一个 CLI-first、local-first 的通用科研 Agent 平台。它的目标不是只做文献调研，而是提供一个可扩展的科研 Agent Runtime，让文献调研、实验设计、算法发现、代码编写、数据分析、论文写作等能力都能通过独立 capability pack 接入。
 
-当前版本重点完成了通用 Runtime 和 `literature` pack，用 PRISMA-style 文献调研链路验证主 Agent、子 Agent、工具、Artifact、Provenance、Review 和 Workflow 的完整闭环。
+当前版本已经实现通用 Runtime、交互式 CLI、pack 自动选择、StageSpec 驱动的 workflow 约束与验证，以及 `literature` pack 的 PRISMA-style 文献调研闭环。
 
-## 定位
+## 项目定位
 
-`jiuwen-sci` 的核心定位：
+- **通用科研 Agent 平台**：Core Runtime 不写入具体学科知识；领域能力通过 pack 提供。
+- **主控 Agent + Capability Pack**：用户只输入研究目标，Runtime/主控路由按需选择合适 pack。
+- **CLI-first**：支持 `jiuwen-sci` 进入交互式命令行，也支持脚本化 `exec` 和显式 workflow 命令。
+- **Local-first**：Session、tool call、artifact、review finding、provenance 默认保存在本地 `.jiuwen-sci/`。
+- **Artifact-first**：协议、检索结果、筛选表、证据表、PRISMA flow、最终报告都落成 artifact，便于追踪和复核。
+- **Verifier-oriented**：Workflow 不再承担“硬编码流程控制”的全部责任，而是作为约束和验证框架；每个 stage 由 deterministic verifier 与 review agent 共同决定是否通过、返工或跳转。
 
-- **通用科研 Agent 平台**：Core Runtime 不包含 Paper、DOI、PRISMA 等领域概念，领域能力通过 pack 扩展。
-- **CLI-first**：优先支持终端使用方式，适合本地科研工作流和自动化脚本。
-- **Local-first**：Session、messages、tool calls、artifacts、provenance 默认保存在本地 `.jiuwen-sci/`。
-- **Session-centered**：每次任务创建一个主 Session，子 Agent 通过 Task Tool 创建 Child Session。
-- **Artifact-first**：重要中间结果写入 Artifact，不把大 JSON/Markdown 塞进模型上下文。
-- **Provenance-aware**：记录 artifact、source、claim、tool/session 之间的派生与支持关系。
-- **Pack-extensible**：不同科研场景通过 capability pack 接入，而不是修改 Core。
+## 架构设计
 
-## 当前架构
+整体结构：
 
 ```text
-CLI
+CLI / REPL
   -> RuntimeHost
-  -> ExecutionEngine
-  -> StrategySelector / RuntimeGuard
-  -> Runner
-     - direct
-     - retry
-     - critic_revise
-     - workflow_controlled
-  -> AgentSessionRunner / WorkflowRunner
-  -> ToolRuntime
-  -> ArtifactStore / ProvenanceStore / ReviewStore
-  -> Capability Packs
+     -> PackWorkflowSelector
+     -> ExecutionEngine
+        -> StrategySelector / RuntimeGuard
+        -> Runner
+           - direct
+           - retry
+           - critic_revise
+           - workflow_controlled
+        -> AgentSessionRunner / WorkflowRunner / StageContractRunner
+     -> ToolRuntime
+     -> Stores
+        - SessionStore
+        - MessageStore
+        - ToolCallStore
+        - ArtifactStore
+        - ProvenanceStore
+        - ReviewStore
+     -> Capability Packs
+        - literature
+        - future: experiment / algorithm / coding / data
 ```
+
+核心抽象：
+
+- **RuntimeHost**：启动 runtime，注册 agents/tools/reviewers/packs，执行任务或恢复 session。
+- **ExecutionEngine**：根据 strategy 调用对应 runner。
+- **PackWorkflowSelector**：根据用户目标和已注册 pack 的 workflow catalog 选择合适 workflow。
+- **StageSpec**：定义一个 stage 的目标、agent、允许工具、必需 artifact、verifier、gate 策略和下一阶段。
+- **Verifier**：执行确定性检查，例如 artifact 是否齐全、PRISMA 计数是否一致、筛选是否覆盖所有记录。
+- **Review Agent**：执行 LLM-based 语义检查，例如主题漂移、证据不足、引用不一致。
+- **Capability Pack**：领域能力包，包含 agents、tools、workflows、stage contracts、verifiers 和可选激活逻辑。
 
 目录结构：
 
 ```text
 jiuwen-sci/
 ├── apps/
-│   └── cli/                    # jiuwen-sci CLI
+│   └── cli/                    # jiuwen-sci CLI / REPL
 ├── packages/
 │   ├── core/                   # 通用 Agent Runtime
 │   └── packs/
 │       └── literature/         # PRISMA-style 文献调研 pack
 ├── tests/                      # node:test 集成测试
-├── .jiuwen-sci/
-│   ├── config.toml             # 本地配置示例，不存放 API key
-│   ├── runtime.db              # 本地 SQLite，已 gitignore
-│   ├── artifacts/              # 内容寻址 artifact，已 gitignore
-│   ├── logs/                   # 已 gitignore
-│   └── cache/                  # 已 gitignore
+├── .jiuwen-sci/                # 本地 runtime 数据，已 gitignore
+│   ├── runtime.db
+│   ├── artifacts/
+│   ├── logs/
+│   └── cache/
 └── jiuwen-sci-phase1-design.md # 第一阶段设计文档
 ```
 
-## 已完成能力
+## 当前已实现功能
+
+### CLI
+
+- `jiuwen-sci` 无参数进入交互式 REPL。
+- 在 REPL 中直接输入研究目标，Runtime 会按需选择 pack。
+- 支持基础 slash commands：
+  - `/help`
+  - `/status`
+  - `/model`
+  - `/packs`
+  - `/sessions [n]`
+  - `/session [id]`
+  - `/tree [id]`
+  - `/artifacts [id|last]`
+  - `/artifact <id>`
+  - `/review [id]`
+  - `/exit`
+- 支持 `exec`、`resume`、`doctor`、`session`、`artifact`、`review`、`pack`、`literature review` 等非交互命令。
+- CLI 会在需要时自动用 `--experimental-sqlite` 重启自身，用户不需要手动记住 Node 参数。
 
 ### Core Runtime
 
-- RuntimeHost 生命周期管理和 pack/agent/tool/reviewer 注册。
+- RuntimeHost 生命周期管理。
+- Agent / Tool / Reviewer / Pack Registry。
 - SQLite-backed stores：
-  - SessionStore
-  - MessageStore
-  - ToolCallStore
-  - ProvenanceStore
-  - ReviewStore
+  - sessions
+  - messages
+  - tool calls
+  - strategy records
+  - artifacts metadata
+  - provenance graph
+  - review findings
 - Filesystem ArtifactStore：
-  - artifact 内容写入 `.jiuwen-sci/artifacts/`
-  - SQLite 只保存索引和 hash
-- Agent Registry / Tool Registry / Reviewer Registry / Pack Registry。
+  - artifact 内容按 sha256 存储在 `.jiuwen-sci/artifacts/`
+  - SQLite 保存索引、hash、media type 和创建来源
 - ToolRuntime：
-  - 所有工具调用记录 tool call
-  - 工具创建 artifact 走 ToolContext
-  - 工具可写 provenance
+  - 工具输入 schema 校验
+  - 工具调用记录
+  - 工具创建 artifact
+  - 工具记录 provenance
 - Task Tool：
-  - 子 Agent 通过 Child Session 执行
-  - Parent/Child Session 有 provenance `spawned` 关系
-- Execution Strategy：
+  - 子 Agent 通过 child session 执行
+  - 支持 parent/child session tree
+- Execution strategies：
   - `direct`
   - `retry`
   - `critic_revise`
   - `workflow_controlled`
-- Runtime Guard：
-  - 拒绝或降级未实现的 loop/best-of-n/tree-search 策略
-- Pack workflow 选择：
-  - Runtime 会在已注册 pack 的 workflow 中按需选择
-  - 例如普通 `exec "请调研..."` 会路由到 `literature-review`
-  - Pack 是否可用由注册/配置控制，模型不能任意加载未知 pack
-- OpenAI-compatible provider：
-  - 支持普通 OpenAI-compatible API
-  - 支持火山引擎 Ark Coding Plan fallback
-  - 支持 `volcengine:glm-5.2`
-- MockProvider：
-  - 所有核心测试可离线运行
+- Pack workflow 自动选择：
+  - 用户输入“调研/文献/论文/综述”等目标时会路由到 `literature-review`
+  - selector 优先使用启发式，高置信度不足时可请求模型选择
+- Provider：
+  - mock provider，用于离线测试
+  - OpenAI-compatible provider
+  - Volcengine Ark Coding Plan fallback
+  - 已适配 `volcengine:glm-5.2`
+
+### Stage Contract / Verifier
+
+- StageSpec 支持：
+  - stage id / goal
+  - stage agent
+  - allowed tools
+  - required artifacts
+  - deterministic verifiers
+  - semantic review agent
+  - retry policy
+  - gate rules
+  - stage transitions
+- Gate 支持：
+  - hard gate failed -> retry
+  - verifier failed -> retry or jump
+  - review blocking -> retry or jump
+  - review major/high -> retry
+  - passed -> next stage
+- Verifier 和 review agent 共同作用：
+  - 函数检查提供底线和结构化信号
+  - LLM review 基于 artifact 与函数检查结果做语义判断
 
 ### Literature Pack
 
-`packages/packs/literature` 已实现 PRISMA-style 文献调研工作流。
+`packages/packs/literature` 已实现 PRISMA-style 文献调研流程。
 
-已注册 connector：
+当前 stage：
+
+1. `protocol_query`
+   - 生成 research question、concepts、database plan、queries、IC/EC criteria。
+2. `search_dedupe`
+   - 多数据库检索、source error 记录、citation-chain hints、去重。
+3. `screening`
+   - title/abstract screening，记录每篇文献 include/exclude/uncertain 和理由。
+4. `eligibility_quality`
+   - eligibility assessment、quality tier、included studies、evidence table。
+5. `citation_synthesis_review`
+   - citation verification、BibTeX、PRISMA flow、final report、review findings。
+
+已注册数据源 connector：
 
 - OpenAlex
 - arXiv
@@ -122,7 +192,7 @@ jiuwen-sci/
 - `evidence_table_write`
 - `citation_check`
 
-文献调研 workflow 产物包括：
+典型 artifact：
 
 - `protocol.json`
 - `queries.json`
@@ -141,18 +211,27 @@ jiuwen-sci/
 - `review_findings.json`
 - `final_report.md`
 
-## 环境要求
+已实现的可靠性改进：
+
+- 数据库名归一化：模型可输出 `OpenAlex`、`Semantic Scholar` 或对象形式，执行前会映射到已注册 connector id。
+- 不支持的数据源过滤：例如 Scopus、Web of Science 不会进入执行调用，除非未来注册对应 connector。
+- arXiv 查询韧性：
+  - arXiv 使用短 query profile
+  - 复杂布尔查询会转换为 `all:"term"` 风格
+  - arXiv 专用 timeout / retry / backoff
+  - retryable source error 会触发 fallback query
+- topic profile 泛化：
+  - literature pack 不硬编码 AI4S 领域词
+  - 领域词应来自用户问题、protocol artifact、主控 Agent 或 `metadata.topicProfile`
+
+## 安装
+
+环境要求：
 
 - Node.js 22+
 - npm 11+
 
-当前使用 Node 22 的 `node:sqlite`，运行 CLI 和测试时需要加：
-
-```bash
---experimental-sqlite
-```
-
-## 安装
+安装：
 
 ```bash
 git clone https://github.com/zy95-12/jiuwen-sci-demo.git
@@ -161,22 +240,26 @@ npm install
 npm run build
 ```
 
-运行测试：
+验证：
 
 ```bash
 npm test
 ```
 
-## 配置方法
+## 配置
 
 ### Mock 模型
 
-默认可直接使用 mock provider：
+Mock provider 可离线运行：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model mock:deterministic \
-  exec "hello"
+jiuwen-sci --model mock:deterministic doctor
+```
+
+如果未安装 bin，可使用：
+
+```bash
+node apps/cli/dist/index.js --model mock:deterministic doctor
 ```
 
 ### 火山引擎 GLM 5.2
@@ -184,120 +267,111 @@ node --experimental-sqlite apps/cli/dist/index.js \
 推荐使用环境变量，不要把 API key 写入仓库：
 
 ```bash
-export OPENAI_API_KEY="你的火山引擎 API key"
+export OPENAI_API_KEY="your_api_key"
 export OPENAI_BASE_URL="https://ark.cn-beijing.volces.com/api/coding/v3"
 ```
 
-然后运行：
+运行：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model volcengine:glm-5.2 \
-  exec "用一句中文回答：连接测试。"
+jiuwen-sci --model volcengine:glm-5.2 doctor
 ```
 
-本地开发时也支持从 `/root/.ark-helper/config.yaml` 读取 `api_key` 作为 fallback。该文件不在本仓库内，也不应提交。
-
-`.jiuwen-sci/config.toml` 只保存非敏感配置示例：
-
-```toml
-default_model = "mock:deterministic"
-
-[providers.openai_compatible]
-base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
-api_key_env = "OPENAI_API_KEY"
-default_volcengine_model = "glm-5.2"
-```
+本地开发时也支持从 `/root/.ark-helper/config.yaml` 读取 fallback key。该文件不属于本仓库，不应提交。
 
 ## 使用方法
 
-### 环境诊断
+### 交互式使用
+
+进入 CLI：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js doctor
+jiuwen-sci --model volcengine:glm-5.2
 ```
 
-### 普通任务
+输入研究目标：
 
-```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model mock:deterministic \
-  exec "写一句关于科研 Agent Runtime 的介绍"
+```text
+jiuwen-sci> 请调研 AI4S 的发展现状和趋势
 ```
 
-使用火山 GLM 5.2：
+查看最近任务：
 
-```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model volcengine:glm-5.2 \
-  exec "写一句关于科研 Agent Runtime 的介绍"
+```text
+jiuwen-sci> /sessions 5
+jiuwen-sci> /tree
+jiuwen-sci> /artifacts last
+jiuwen-sci> /artifact <artifact-id>
+jiuwen-sci> /exit
 ```
 
-### 自动选择 pack workflow
-
-普通 `exec` 会在已注册 pack 中按需选择 workflow：
+### 单轮自动执行
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model mock:deterministic \
-  exec "请调研 AI agents for scientific discovery 的文献"
+jiuwen-sci --model volcengine:glm-5.2 \
+  "请调研 AI agents for scientific discovery 的文献"
 ```
 
-该命令会自动路由到 `literature-review` workflow。
+这会走 `strategy:auto`，由 Runtime 判断是否选择 `literature-review` workflow。
 
-### 显式运行文献调研
+### 显式执行文献调研
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model mock:deterministic \
+jiuwen-sci --model volcengine:glm-5.2 \
+  literature review "AI4S 的发展现状和趋势" \
+  --db openalex,arxiv,semantic-scholar,crossref,pubmed,europepmc \
+  --limit 20 \
+  --max-review-rounds 2
+```
+
+快速本地验证：
+
+```bash
+jiuwen-sci --model mock:deterministic \
   literature review "AI agents for scientific discovery" \
-  --limit 10 \
-  --db openalex,semantic-scholar,crossref
+  --db openalex \
+  --limit 2
 ```
 
-为了减少网络波动，快速验证可先用：
+### 查看历史和产物
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js \
-  --model mock:deterministic \
-  literature review "AI agents for scientific discovery" \
-  --limit 2 \
-  --db openalex
+jiuwen-sci session list
+jiuwen-sci session show <session-id>
+jiuwen-sci session tree <session-id>
+
+jiuwen-sci artifact list --session <session-id>
+jiuwen-sci artifact cat <artifact-id>
+
+jiuwen-sci review list --session <session-id>
+jiuwen-sci provenance trace <artifact-or-node-id>
 ```
 
-### 查看 Session
+### 后台执行长任务
+
+长任务建议用 `systemd-run`，避免 SSH 断开后进程被回收：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js session list
-node --experimental-sqlite apps/cli/dist/index.js session show <session-id>
-node --experimental-sqlite apps/cli/dist/index.js session tree <session-id>
+run_id="ai4s-$(date +%Y%m%d-%H%M%S)"
+unit="jiuwen-${run_id}"
+log="/root/jiuwen-sci/.jiuwen-sci/logs/${run_id}.log"
+
+systemd-run --unit="$unit" --working-directory=/root/jiuwen-sci \
+  /bin/bash -lc "node apps/cli/dist/index.js --model volcengine:glm-5.2 --verbose literature review 'AI4S的发展现状和趋势' --db openalex,arxiv,semantic-scholar,crossref,pubmed,europepmc --limit 20 --max-review-rounds 2 > '$log' 2>&1; code=\$?; echo EXIT_CODE=\$code >> '$log'; exit \$code"
 ```
 
-### 查看 Artifact
+监控：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js artifact list
-node --experimental-sqlite apps/cli/dist/index.js artifact list --session <session-id>
-node --experimental-sqlite apps/cli/dist/index.js artifact cat <artifact-id>
+systemctl status "$unit" --no-pager
+tail -f "$log"
 ```
 
-### 查看 Provenance
+## 安全说明
 
-```bash
-node --experimental-sqlite apps/cli/dist/index.js provenance trace <artifact-or-node-id>
-```
+不要提交任何真实 API key。
 
-### 查看 Review Findings
-
-```bash
-node --experimental-sqlite apps/cli/dist/index.js review list --session <session-id>
-```
-
-## 安全与密钥说明
-
-本仓库不应包含任何真实 API key。
-
-已通过 `.gitignore` 排除：
+已 gitignore：
 
 - `.env`
 - `.env.*`
@@ -317,56 +391,42 @@ git status --short
 git diff --cached
 ```
 
-不要提交：
-
-- 火山引擎 API key
-- OpenAI/Anthropic/Gemini API key
-- 本地 runtime DB
-- 本地 artifacts
-- `.ark-helper` 配置
-
 ## 当前限制
 
-- Literature workflow 已接近 PRISMA-style，但仍不是生产级系统综述工具。
-- Citation chaining 当前以 connector 元数据为基础，尚未完整展开 forward/backward citation graph。
+- 当前文献调研是 PRISMA-style，不等同于生产级系统综述。
+- Synthesis 仍偏模板化，深度综述能力还需要加强。
 - Full-text/PDF 下载和 section-level evidence extraction 尚未实现。
-- Reviewer 已有结构，但 citation mismatch、untraceable number、figure/stat mismatch 还需要更强的自动审计。
-- Provenance 已支持 source/claim 粒度，但 claim-level review gate 仍需增强。
+- Citation chaining 已有 hints 和部分 fetch，但还没有完整的 saturation strategy。
+- Semantic Scholar 未配置 API key 时容易被 429 限流。
+- Reviewer 已能参与 gate，但 claim-level audit、统计数字校验、图表/表格校验仍需增强。
 - 当前没有 Web UI。
 - 当前没有 notebook/Python kernel、远程 GPU/SLURM、实验调度能力。
 
-## 未来计划
+## 后续计划
 
-### 通用 Runtime
+### Runtime
 
-- 配置文件加载和 `config set/get` CLI。
-- 更完整的 interactive mode 和 slash commands。
-- 更严格的 sandbox/permission 实现。
-- 更完善的 event stream 和 JSONL 输出。
-- Provider catalog 和模型能力描述。
-- 并发 task 调度和取消/恢复能力。
-- 更强的 provenance trace 查询。
-- Reviewer gate 与 revision loop 的标准化。
+- 更完整的配置系统与 `config get/set`。
+- 更细粒度的权限与 sandbox。
+- JSONL event stream 和更完善的后台任务管理。
+- session resume 的多轮上下文策略。
+- provenance graph 查询增强。
+- review finding resolution / accepted risk 工作流。
 
 ### Literature Pack
 
-- 完整 citation chaining：
-  - backward references
-  - forward citations
-  - saturation criterion
-- DOI/PMID/arXiv ID 交叉验证。
-- BibTeX 格式校验和 citation key 去重。
 - PDF/full-text 获取。
 - section-level evidence extraction。
-- 更严格的 inclusion/exclusion criteria DSL。
+- DOI/PMID/arXiv ID 交叉验证。
+- citation graph 深度扩展和 saturation criterion。
 - ASReview-style active screening。
-- citation mismatch 检查。
 - contradiction clustering。
+- 更强的 final synthesis 结构化综述。
 - PRISMA flow diagram 可视化。
 
-### 未来 Packs
+### Future Packs
 
-建议新增：
+计划新增：
 
 ```text
 packages/packs/experiment
@@ -394,22 +454,7 @@ packages/packs/data
   - visualization
 ```
 
-这些 pack 应复用 Core Runtime 的通用能力：
-
-```text
-Session
-Agent
-Tool
-Task
-Workflow
-Artifact
-Provenance
-Review
-Provider
-Strategy
-```
-
-避免把领域概念写入 Core。
+这些 pack 应复用 Core Runtime 的通用抽象，避免把领域概念写入 Core。
 
 ## 开发命令
 
@@ -419,10 +464,11 @@ npm run build
 npm test
 ```
 
-CLI 本地运行：
+本地 CLI：
 
 ```bash
-node --experimental-sqlite apps/cli/dist/index.js doctor
+node apps/cli/dist/index.js doctor
+node apps/cli/dist/index.js --model mock:deterministic
 ```
 
 ## License
