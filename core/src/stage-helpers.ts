@@ -88,6 +88,31 @@ export function renderStageAgentPrompt(input: { contract: StageContractDefinitio
   ].filter(Boolean).join("\n\n");
 }
 
+export function renderStageReviewPrompt(input: { stage: StageSpec; artifactManifest: unknown; feedback: string[] }): string {
+  const feedback = input.feedback.length ? `\nPrevious review feedback/errors to account for:\n${input.feedback.map((m) => `- ${m}`).join("\n")}\n` : "";
+  return [
+    `Review stage "${input.stage.id}" for semantic quality and blocking issues.`,
+    `Stage goal: ${input.stage.goal}`,
+    input.stage.instructions ? `Stage output contract for reference:\n${input.stage.instructions}` : "",
+    input.stage.reviewInstructions ? `Stage-specific review checklist:\n${input.stage.reviewInstructions}` : "",
+    "Use the verifier_report artifact to avoid repeating deterministic checks. Focus on semantic risks, traceability gaps, process gaps, and evidence-quality issues relevant to this stage.",
+    "Review output contract:",
+    "- If there are no semantic issues, call finalize with a concise summary and do not call review_finding_write.",
+    "- If there is a semantic issue, call review_finding_write once per issue before finalize.",
+    "- review_finding_write.description is required. It must be a concrete explanation of the issue, not an empty string.",
+    "- review_finding_write.severity is required for meaningful findings. Use blocking for issues that invalidate the stage, high for issues requiring retry, major for important but potentially continuable issues, minor/info for advisory notes.",
+    "- review_finding_write.category should be a short stable label, for example topic_drift, missing_evidence, inconsistent_criteria, incomplete_output, unsupported_claim, or process_gap.",
+    "- review_finding_write.targetType should name the affected object, for example stage, artifact, output, plan, table, or report.",
+    "- review_finding_write.targetRef should cite the exact stage id or artifact id from the manifest.",
+    "- review_finding_write.suggestedAction should state what the next retry must change.",
+    "Example finding tool call content:",
+    "{\"severity\":\"high\",\"category\":\"process_gap\",\"targetType\":\"artifact\",\"targetRef\":\"art_xxx\",\"description\":\"The stage output omits a required decision rationale for several records, so downstream steps cannot audit why they were accepted or rejected.\",\"suggestedAction\":\"Regenerate the stage output with an explicit rationale for every decision before proceeding.\"}",
+    `Artifact manifest:\n${JSON.stringify(input.artifactManifest, null, 2)}`,
+    feedback,
+    "Do not call artifact_read unless artifactId is copied exactly from this manifest. Do not call review_finding_write without description."
+  ].filter(Boolean).join("\n\n");
+}
+
 export function formatVerifierFeedback(result: StageVerifierResult & { verifierId: string; hardGate?: boolean }): string {
   const lines = [`${result.verifierId} failed${result.targetRef ? ` on ${result.targetRef}` : ""}: ${result.message}`];
   const diagnostics = result.diagnostics;
@@ -117,33 +142,12 @@ export async function createArtifactManifest(services: RuntimeServices, artifact
         // Ignore non-JSON content with a JSON media type.
       }
     }
-    const role = stageToArtifactRole(stage) ?? artifact.type;
+    const role = stage ?? artifact.type;
     artifacts.push({ id: artifact.id, type: artifact.type, mediaType: artifact.mediaType, stage, role, size: artifact.size, createdAt: artifact.createdAt });
     if (stage) byStage[stage] = [...(byStage[stage] ?? []), artifact.id];
     if (role) byRole[role] = [...(byRole[role] ?? []), artifact.id];
   }
   return { artifacts, byStage, byRole };
-}
-
-function stageToArtifactRole(stage?: string): string | undefined {
-  const roles: Record<string, string> = {
-    protocol: "protocol",
-    queries: "query_plan",
-    identification: "identification",
-    citation_chaining: "citation_chaining",
-    deduplication: "deduped_papers",
-    screening_log: "screening_log",
-    eligibility_log: "eligibility_log",
-    quality_assessment: "quality_assessment",
-    included_studies: "included_studies",
-    evidence_table: "evidence_table",
-    contradiction_detection: "contradiction_detection",
-    citation_verification: "citation_verification",
-    prisma_flow: "prisma_flow",
-    verifier_report: "verifier_report",
-    review_findings: "review_findings"
-  };
-  return stage ? roles[stage] : undefined;
 }
 
 export async function countMatchingArtifacts(services: RuntimeServices, artifactIds: string[], req: ArtifactRequirement): Promise<number> {

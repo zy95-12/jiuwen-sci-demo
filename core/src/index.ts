@@ -12,7 +12,7 @@ import { MockProvider, OpenAICompatibleProvider, readArkHelperApiKey } from "./p
 import { InMemoryAgentRegistry, InMemoryPackRegistry, InMemoryReviewerRegistry, InMemoryStageVerifierRegistry, InMemoryToolRegistry } from "./registries.js";
 import { DefaultEventBus, DefaultPermissionService, DefaultPromptAssembler, DefaultProviderRouter } from "./services.js";
 import { StageContractRunner } from "./stage-contract-runner.js";
-import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, renderStageAgentPrompt, resolveStageTransition } from "./stage-helpers.js";
+import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, renderStageAgentPrompt, renderStageReviewPrompt, resolveStageTransition } from "./stage-helpers.js";
 import { FilesystemArtifactStore, SqliteMessageStore, SqliteProvenanceStore, SqliteReviewStore, SqliteSessionStore, SqliteStorageConnection, SqliteToolCallStore } from "./storage.js";
 import { ToolRuntime } from "./tool-runtime.js";
 import type { AgentDefinition, CapabilityPack, ModelRef, ReviewerDefinition, RuntimeConfig, RuntimeEvent, RuntimeRunInput, RuntimeRunResult, RuntimeServices, StageVerifierDefinition, ToolDefinition, WorkflowContext } from "./types.js";
@@ -81,7 +81,7 @@ export async function createRuntimeServices(config: RuntimeConfig, eventSink?: (
 export function registerCoreAgents(registry: InMemoryAgentRegistry): void {
   registry.register({ id: "research-orchestrator", name: "Research Orchestrator", description: "General-purpose controller for research tasks.", mode: "primary", supportsStrategySelection: true, prompt: "You coordinate bounded research tasks and produce artifact-backed outputs.", permissions: [], allowedTools: ["task", "artifact_read", "artifact_write", "finalize"], maxTurns: 8 });
   registry.register({ id: "task-agent", name: "Task Agent", description: "General-purpose subagent for bounded delegated tasks.", mode: "subagent", prompt: "You complete a bounded delegated task and finalize with a concise artifact-backed result.", permissions: [], allowedTools: ["artifact_read", "artifact_write", "finalize"], maxTurns: 6 });
-  registry.register({ id: "reviewer", name: "Reviewer", description: "Read-only reviewer for checking consistency.", mode: "subagent", prompt: "Review current artifacts and record findings. Do not write new source artifacts.", permissions: [], allowedTools: ["artifact_read", "review_finding_write", "finalize"], maxTurns: 6 });
+  registry.register({ id: "reviewer", name: "Reviewer", description: "Read-only reviewer for checking consistency.", mode: "subagent", prompt: "Review current artifacts and record findings. Do not write new source artifacts. When recording a finding, review_finding_write.description is mandatory and must explain the issue concretely. If there are no findings, finalize without calling review_finding_write.", permissions: [], allowedTools: ["artifact_read", "review_finding_write", "finalize"], maxTurns: 6 });
 }
 
 export function registerCoreTools(registry: InMemoryToolRegistry): void {
@@ -122,7 +122,7 @@ export type { ExecutionRunner } from "./execution.js";
 
 export { StageContractRunner } from "./stage-contract-runner.js";
 
-export { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, renderStageAgentPrompt, resolveStageTransition } from "./stage-helpers.js";
+export { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, renderStageAgentPrompt, renderStageReviewPrompt, resolveStageTransition } from "./stage-helpers.js";
 
 export { AgentSessionRunner } from "./agent-session-runner.js";
 

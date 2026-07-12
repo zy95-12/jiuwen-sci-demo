@@ -9,6 +9,7 @@ import {
   InMemoryAgentRegistry,
   InMemoryToolRegistry,
   renderStageAgentPrompt,
+  renderStageReviewPrompt,
   StageContractRunner,
   ToolRuntime
 } from "@jiuwen-sci/core";
@@ -344,6 +345,41 @@ test("literature protocol query prompt includes canonical field contract", async
   } finally {
     await cleanup();
   }
+});
+
+test("stage review prompt includes finding schema and retry feedback", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    const contract = runtime.services.packRegistry.getStageContract("literature-review-prisma-v1");
+    const stage = contract.stages.find((item) => item.id === "screening");
+    const prompt = renderStageReviewPrompt({
+      stage,
+      artifactManifest: { artifacts: [{ id: "art_screen", stage: "screening_log" }], byStage: { screening_log: ["art_screen"] }, byRole: {} },
+      feedback: ["stage_review_failed: TOOL_INPUT_INVALID: review_finding_write.description is required"]
+    });
+    assert.match(prompt, /review_finding_write\.description is required/);
+    assert.match(prompt, /severity/);
+    assert.match(prompt, /targetRef/);
+    assert.match(prompt, /Example finding tool call content/);
+    assert.match(prompt, /Stage-specific review checklist/);
+    assert.match(prompt, /PRISMA screening completeness/);
+    assert.match(prompt, /TOOL_INPUT_INVALID/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("core stage review prompt stays domain-neutral without pack checklist", () => {
+  const prompt = renderStageReviewPrompt({
+    stage: { id: "generic", goal: "Review a generic stage." },
+    artifactManifest: { artifacts: [], byStage: {}, byRole: {} },
+    feedback: []
+  });
+  assert.match(prompt, /Review output contract/);
+  assert.match(prompt, /process gaps/);
+  assert.doesNotMatch(prompt, /PRISMA/);
+  assert.doesNotMatch(prompt, /citation-chain/);
 });
 
 test("literature database normalization keeps only executable connector ids", async () => {
@@ -1047,6 +1083,55 @@ test("successful stage review resolves stale review execution failures", async (
     assert.equal(result.status, "completed");
     const findings = await runtime.services.reviewStore.listBySession(session.id);
     assert.equal(findings.find((finding) => finding.id === stale.id)?.status, "resolved");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage reviewer receives previous review failure feedback", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    const contract = {
+      id: "review-feedback-contract",
+      name: "Review Feedback Contract",
+      description: "Reviewer prompt should include prior review execution failures.",
+      initialStageId: "screening",
+      stages: [{
+        id: "screening",
+        goal: "Create a screening artifact and review it.",
+        review: { agentId: "reviewer", mode: "always" },
+        retryPolicy: { maxAttempts: 1 },
+        gate: {
+          rules: [
+            { when: "review_major", action: "partial" },
+            { when: "passed", action: "next" }
+          ]
+        },
+        run: async (ctx) => {
+          const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log" }) });
+          return { artifactIds: [artifact.id] };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "review-feedback-pack", name: "Review Feedback Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "screening", cwd: runtime.services.config.cwd });
+    await runtime.services.reviewStore.create({
+      sessionId: session.id,
+      severity: "major",
+      category: "stage_review_failed",
+      targetType: "stage",
+      targetRef: "screening",
+      description: "Stage review agent failed; continuing with deterministic gate only: TOOL_INPUT_INVALID: review_finding_write.description is required"
+    });
+
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "review-feedback-contract", userGoal: "screening" });
+
+    assert.equal(result.status, "completed");
+    const children = await runtime.services.sessionStore.children(session.id);
+    const reviewer = children.find((child) => child.agentId === "reviewer");
+    assert.ok(reviewer);
+    assert.match(reviewer.input, /Previous review feedback\/errors/);
+    assert.match(reviewer.input, /review_finding_write\.description is required/);
   } finally {
     await cleanup();
   }

@@ -174,6 +174,14 @@ export const literatureReviewStageContract: StageContractDefinition = {
     {
       id: "screening",
       goal: "Screen titles and abstracts using explicit inclusion/exclusion criteria and record a reason for every paper.",
+      reviewInstructions: [
+        "- Check PRISMA screening completeness: every deduplicated record must have an include/exclude/uncertain decision and reason.",
+        "- Check topic drift: included papers must match the review concepts, not only broad trend or methodology words.",
+        "- Check criterion consistency against protocol/query artifacts; flag undocumented changes in date range, study type, source scope, or inclusion/exclusion rules.",
+        "- Check source coverage gaps: rate limits, failed databases, or unsupported sources should be documented and considered in the review risk.",
+        "- Check citation-chain handling: if citation-chain hints are not merged into screening, the omission or rationale must be auditable in later PRISMA artifacts.",
+        "- Typical categories: topic_drift, prisma_flow_gap, criterion_drift, source_coverage_gap, screening_rigor."
+      ].join("\n"),
       agentId: "literature-screening-agent",
       allowedTools: ["artifact_read", "artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "screening_log" }],
@@ -215,6 +223,14 @@ export const literatureReviewStageContract: StageContractDefinition = {
     {
       id: "eligibility_quality",
       goal: "Assess eligibility, assign evidence quality tiers, and extract structured evidence rows.",
+      reviewInstructions: [
+        "- Check abstract/full-text eligibility decisions against the protocol and user brief.",
+        "- Check that included studies have sufficient metadata, abstract/full-text evidence, and explicit eligibility rationale.",
+        "- Check quality tiers for consistency with venue, peer review status, citation metadata, recency, and empirical detail.",
+        "- Check that evidence_table rows cite included study ids and provide claim-level support, not only paper-level summaries.",
+        "- Check that user evidence preferences, such as DOI, date range, abstract requirement, source preference, and minimum quality, are enforced or explicitly documented.",
+        "- Typical categories: eligibility_gap, quality_misclassification, evidence_gap, preference_violation, topic_drift."
+      ].join("\n"),
       agentId: "literature-eligibility-agent",
       allowedTools: ["artifact_read", "artifact_write", "evidence_table_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "eligibility_log" }, { type: "json", stage: "quality_assessment" }, { type: "json", stage: "included_studies" }, { type: "json", stage: "evidence_table" }],
@@ -274,6 +290,14 @@ export const literatureReviewStageContract: StageContractDefinition = {
     {
       id: "citation_synthesis_review",
       goal: "Verify citations, write BibTeX, produce PRISMA flow, synthesize the report, and run final semantic review.",
+      reviewInstructions: [
+        "- Check citation integrity: every substantive claim in the synthesis should be traceable to evidence_table rows and verified included studies.",
+        "- Check PRISMA count consistency across identification, deduplication, screening, eligibility, included studies, and citation-chain hint accounting.",
+        "- Check that source errors and coverage gaps are disclosed in the final report when they may affect conclusions.",
+        "- Check that contradictions and limitations are represented, not flattened into a one-sided summary.",
+        "- Check that output preferences from the user brief are reflected, including language, depth, focus institutions/domains, and requested report sections.",
+        "- Typical categories: citation_mismatch, unsupported_claim, prisma_count_gap, source_coverage_gap, synthesis_gap, preference_violation."
+      ].join("\n"),
       agentId: "literature-synthesis-agent",
       allowedTools: ["citation_verify", "bibtex_write", "prisma_flow_write", "artifact_read", "artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "citation_verification" }, { type: "json", stage: "prisma_flow" }, { type: "markdown", minCount: 2 }],

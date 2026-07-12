@@ -1,7 +1,7 @@
 import { createInternalToolContext } from "./contexts.js";
 import { taskTool } from "./core-tools.js";
 import { RuntimeError } from "./errors.js";
-import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, formatVerifierFeedback, renderStageAgentPrompt, resolveStageTransition } from "./stage-helpers.js";
+import { countMatchingArtifacts, createArtifactManifest, decideGateAction, effectiveGate, formatVerifierFeedback, renderStageAgentPrompt, renderStageReviewPrompt, resolveStageTransition } from "./stage-helpers.js";
 import { ToolRuntime } from "./tool-runtime.js";
 import type {
   Artifact,
@@ -195,6 +195,7 @@ export class StageContractRunner {
     const existingStageFindings = (await this.services.reviewStore.listBySession(sessionId)).filter((finding) => finding.targetType === "stage" && finding.targetRef === stage.id && finding.status === "open" && ["stage_agent_failed", "stage_review_failed"].includes(finding.category));
     const existingReviewFailures = existingStageFindings.filter((finding) => finding.category === "stage_review_failed");
     semanticFindings.push(...existingStageFindings.filter((finding) => finding.category !== "stage_review_failed"));
+    const reviewFeedback = [...messages, ...existingStageFindings.map((finding) => `${finding.category}: ${finding.description}`)];
 
     if (reviewPolicy?.mode === "always" || (reviewPolicy?.mode === "on_failure" && !deterministicOk)) {
       if (reviewPolicy.reviewerId) {
@@ -208,7 +209,7 @@ export class StageContractRunner {
           const review = await taskTool.execute(createInternalToolContext(this.services, sessionId, "stage-runner"), {
             agentId: reviewPolicy.agentId,
             description: `Review stage ${stage.id}`,
-            input: `Review stage "${stage.id}" for semantic quality and blocking issues. Use the verifier_report artifact to avoid repeating deterministic checks and focus on semantic risks.\n\nArtifact manifest:\n${JSON.stringify(artifactManifest, null, 2)}\n\nDo not call artifact_read unless artifactId is copied exactly from this manifest.`,
+            input: renderStageReviewPrompt({ stage, artifactManifest, feedback: reviewFeedback }),
             contextArtifactIds: artifactIdsWithReport
           });
           const childFindings = await this.services.reviewStore.listBySession(review.childSessionId);
