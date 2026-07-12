@@ -8,6 +8,7 @@ import {
   DefaultStrategyGuard,
   InMemoryAgentRegistry,
   InMemoryToolRegistry,
+  renderStageAgentPrompt,
   StageContractRunner,
   ToolRuntime
 } from "@jiuwen-sci/core";
@@ -319,6 +320,23 @@ test("literature protocol verifier prefers latest artifacts and accepts common f
     const conceptVerifier = runtime.services.verifierRegistry.get("literature_query_concepts_valid");
     assert.equal((await protocolVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
     assert.equal((await conceptVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("literature protocol query prompt includes canonical field contract", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    const contract = runtime.services.packRegistry.getStageContract("literature-review-prisma-v1");
+    const stage = contract.stages.find((item) => item.id === "protocol_query");
+    const prompt = renderStageAgentPrompt({ contract, stage, userGoal: "AI4S", attempt: 1, feedback: [], artifactManifest: { artifacts: [], byStage: {}, byRole: {} } });
+    assert.match(prompt, /Stage-specific output contract/);
+    assert.match(prompt, /selectedQueries\[\]\.string/);
+    assert.match(prompt, /Use query, not string/);
+    assert.match(prompt, /coreTerms/);
+    assert.match(prompt, /topicExpansion/);
   } finally {
     await cleanup();
   }
@@ -717,6 +735,64 @@ test("stage contract retries a failed stage with verifier feedback", async () =>
     assert.ok(reports.some((report) => report.deterministicChecks.some((check) => check.verifierId === "test_ready" && check.diagnostics?.missing?.includes("draft.ready"))));
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.failed" && event.stageId === "draft"));
     assert.ok(runtime.services.eventBus.events.some((event) => event.type === "stage.completed" && event.stageId === "draft" && event.attempt === 2));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("stage retry isolates current-attempt artifacts from failed attempts", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.services.verifierRegistry.register({
+      id: "attempt_ready",
+      description: "Pass only on the second attempt.",
+      async verify(ctx) {
+        return ctx.state.ready === true
+          ? { ok: true, message: "ready" }
+          : { ok: false, message: "not ready", severity: "major", category: "attempt_not_ready" };
+      }
+    });
+    const contract = {
+      id: "attempt-isolation-contract",
+      name: "Attempt Isolation Contract",
+      description: "Retry attempts should not validate against failed-attempt artifacts.",
+      initialStageId: "draft",
+      stages: [{
+        id: "draft",
+        goal: "Create a draft artifact on each attempt.",
+        requiredArtifacts: [{ type: "json", stage: "draft" }],
+        verifiers: ["artifact_requirements_met", "attempt_ready"],
+        retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
+        run: async (ctx) => {
+          let previousDraftsVisible = 0;
+          for (const id of ctx.artifactIds) {
+            try {
+              const parsed = JSON.parse((await ctx.services.artifactStore.read(id)).toString("utf8"));
+              if (parsed.stage === "draft") previousDraftsVisible += 1;
+            } catch {}
+          }
+          const artifact = await ctx.createArtifact({
+            type: "json",
+            mediaType: "application/json",
+            content: JSON.stringify({ stage: "draft", attempt: ctx.attempt, previousDraftsVisible })
+          });
+          return { artifactIds: [artifact.id], statePatch: { ready: ctx.attempt === 2 } };
+        }
+      }]
+    };
+    runtime.registerPack({ id: "attempt-isolation-pack", name: "Attempt Isolation Pack", version: "0.0.0", stageContracts: [contract] });
+    const session = await runtime.services.sessionStore.create({ agentId: "research-orchestrator", input: "attempt isolation", cwd: runtime.services.config.cwd });
+    const result = await new StageContractRunner(runtime.services).run({ sessionId: session.id, contractId: "attempt-isolation-contract", userGoal: "attempt isolation" });
+    assert.equal(result.status, "completed");
+    const drafts = [];
+    for (const id of result.artifactIds) {
+      try {
+        const parsed = JSON.parse((await runtime.services.artifactStore.read(id)).toString("utf8"));
+        if (parsed.stage === "draft") drafts.push(parsed);
+      } catch {}
+    }
+    assert.equal(drafts.length, 2);
+    assert.equal(drafts.find((draft) => draft.attempt === 2).previousDraftsVisible, 0);
   } finally {
     await cleanup();
   }

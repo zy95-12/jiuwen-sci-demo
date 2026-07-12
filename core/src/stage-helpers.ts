@@ -75,6 +75,7 @@ export function renderStageAgentPrompt(input: { contract: StageContractDefinitio
   return [
     `Run stage "${input.stage.id}" for contract "${input.contract.id}".`,
     `Goal: ${input.stage.goal}`,
+    input.stage.instructions ? `Stage-specific output contract:\n${input.stage.instructions}` : "",
     `User goal:\n${input.userGoal}`,
     `Attempt: ${input.attempt}`,
     `Allowed tools: ${allowedTools}`,

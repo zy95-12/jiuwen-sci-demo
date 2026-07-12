@@ -26,7 +26,8 @@ export class StageContractRunner {
     let currentId: string | undefined = contract.initialStageId;
     let status: RuntimeStatus = "completed";
     let output = "";
-    let artifactIds: string[] = [];
+    let activeArtifactIds: string[] = [];
+    let auditArtifactIds: string[] = [];
     let reviewFindingIds: string[] = [];
     const state: Record<string, unknown> = {};
     const maxStages = contract.maxStages ?? Math.max(20, contract.stages.length * 3);
@@ -37,22 +38,26 @@ export class StageContractRunner {
       if (!stage) throw new RuntimeError("STAGE_NOT_FOUND", currentId);
       await this.services.eventBus.emit({ type: "stage.started", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id });
       const attempts = Math.max(1, stage.retryPolicy?.maxAttempts ?? 1);
+      const stageInputArtifactIds = activeArtifactIds;
       let passed = false;
       let terminalAction: "partial" | "fail" | undefined;
       let lastResult: StageExecutionResult = {};
 
       for (let attempt = 1; attempt <= attempts; attempt++) {
         const feedback = (state[`stage.${stage.id}.feedback`] as string[] | undefined) ?? [];
-        lastResult = await this.runStage({ contract, stage, sessionId: input.sessionId, userGoal: input.userGoal, metadata: input.metadata ?? {}, artifactIds, state, attempt, feedback });
-        artifactIds = [...new Set([...artifactIds, ...(lastResult.artifactIds ?? [])])];
+        lastResult = await this.runStage({ contract, stage, sessionId: input.sessionId, userGoal: input.userGoal, metadata: input.metadata ?? {}, artifactIds: stageInputArtifactIds, state, attempt, feedback });
+        const attemptArtifactIds = [...new Set(lastResult.artifactIds ?? [])];
+        auditArtifactIds = [...new Set([...auditArtifactIds, ...attemptArtifactIds])];
         Object.assign(state, lastResult.statePatch ?? {});
         output = lastResult.output ?? output;
 
-        const gate = await this.evaluateGate(contract, stage, input.sessionId, artifactIds, state, attempt);
-        artifactIds = [...new Set([...artifactIds, gate.reportArtifactId])];
+        const gateArtifactIds = [...new Set([...stageInputArtifactIds, ...attemptArtifactIds])];
+        const gate = await this.evaluateGate(contract, stage, input.sessionId, gateArtifactIds, state, attempt);
+        auditArtifactIds = [...new Set([...auditArtifactIds, gate.reportArtifactId])];
         reviewFindingIds.push(...gate.findingIds);
         if (gate.action === "next" || gate.action === "continue" || gate.action === "go_to_stage") {
           passed = true;
+          activeArtifactIds = [...new Set([...gateArtifactIds, gate.reportArtifactId])];
           if (gate.action === "go_to_stage") lastResult.nextStageId = gate.nextStageId;
           await this.services.eventBus.emit({ type: gate.action === "go_to_stage" ? "stage.redirected" : "stage.completed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, attempt, nextStageId: gate.nextStageId });
           break;
@@ -74,8 +79,8 @@ export class StageContractRunner {
     if (currentId) status = "partial";
     const findings = await this.services.reviewStore.listBySessionTree(input.sessionId);
     reviewFindingIds = [...new Set([...reviewFindingIds, ...findings.map((f) => f.id)])];
-    await this.services.sessionStore.update(input.sessionId, { status: status === "completed" ? "completed" : status, artifactIds: [...new Set(artifactIds)] });
-    return { sessionId: input.sessionId, status, output, artifactIds: [...new Set(artifactIds)], reviewFindingIds };
+    await this.services.sessionStore.update(input.sessionId, { status: status === "completed" ? "completed" : status, artifactIds: [...new Set(auditArtifactIds)] });
+    return { sessionId: input.sessionId, status, output, artifactIds: [...new Set(auditArtifactIds)], reviewFindingIds };
   }
 
   private async runStage(input: { contract: StageContractDefinition; stage: StageSpec; sessionId: string; userGoal: string; metadata: Record<string, unknown>; artifactIds: string[]; state: Record<string, unknown>; attempt: number; feedback: string[] }): Promise<StageExecutionResult> {

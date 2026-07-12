@@ -232,6 +232,7 @@ export type StageSpec = {
   id: string;
   name?: string;
   goal: string;
+  instructions?: string;
   agentId?: string;
   allowedTools?: string[];
   requiredInputs?: string[];
