@@ -843,10 +843,10 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-query-agent",
       allowedTools: ["artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "protocol" }, { type: "json", stage: "queries" }],
-      verifiers: ["artifact_requirements_met", "literature_protocol_valid", "literature_query_concepts_valid"],
+      verifiers: ["artifact_requirements_met", "brief_metadata_valid", "literature_protocol_valid", "literature_query_concepts_valid"],
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
-        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_protocol_valid", hardGate: true }, { id: "literature_query_concepts_valid", hardGate: true }],
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "brief_metadata_valid", hardGate: true }, { id: "literature_protocol_valid", hardGate: true }, { id: "literature_query_concepts_valid", hardGate: true }],
         rules: [
           { when: "hard_gate_failed", action: "retry_stage" },
           { when: "verifier_failed", action: "retry_stage" },
@@ -860,19 +860,21 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const agentProtocol = await readStageArtifact(ctx.services, ctx.artifactIds, "protocol");
         const agentQueries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
         if (agentProtocol && agentQueries) {
+          const briefArtifact = await ensureResearchBriefArtifact(ctx);
           const agentDbs = normalizeLiteratureDatabaseIds(agentProtocol.databases, registry);
           const queryDbs = normalizeLiteratureDatabaseIds(selectedQueryDbs(agentQueries), registry);
           const dbs = metadataDbs.length ? metadataDbs : agentDbs.length ? agentDbs : queryDbs.length ? queryDbs : ["openalex"];
           const topicProfile = topicProfileFromQueries(agentQueries, ctx.input, ctx.metadata.topicProfile);
-          return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile } };
+          return { artifactIds: briefArtifact ? [briefArtifact.id] : [], statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile, researchBriefArtifactId: briefArtifact?.id } };
         }
         const limit = Number(ctx.metadata.limit ?? 25);
         const dbs = metadataDbs.length ? metadataDbs : ["openalex", "semantic-scholar", "crossref"];
         const criteria = defaultCriteria();
         const queryPlan = buildQueryPlan(ctx.input, dbs, criteria, ctx.metadata.topicProfile);
-        const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
+        const briefArtifact = await ensureResearchBriefArtifact(ctx);
+        const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, appliedPreferences: protocolPreferenceSummary(ctx.metadata), workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
         const queries = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify(queryPlan, null, 2) });
-        return { artifactIds: [protocol.id, queries.id], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan, ctx.input, ctx.metadata.topicProfile), protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
+        return { artifactIds: [briefArtifact?.id, protocol.id, queries.id].filter(Boolean) as string[], statePatch: { limit, dbs, criteria, queryPlan, topicProfile: topicProfileFromQueries(queryPlan, ctx.input, ctx.metadata.topicProfile), researchBriefArtifactId: briefArtifact?.id, protocolArtifactId: protocol.id, queriesArtifactId: queries.id } };
       }
     },
     {
@@ -930,7 +932,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const citationChainHintsFound = citationChainRecords.reduce((sum: number, record: any) => sum + Number(record.referenceCount ?? 0) + Number(record.citationCount ?? 0), 0);
         const recordsIdentifiedThroughCitationChaining = 0;
         if (Array.isArray((chain.output as any).errors)) sourceErrors.push(...(chain.output as any).errors);
-        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
+        const identification = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "identification", searchCounts, sourceErrors, appliedPreferences: protocolPreferenceSummary(ctx.metadata), recordsIdentifiedThroughDatabaseSearching: allPapers.length, recordsIdentifiedThroughCitationChaining, citationChainHintsFound }, null, 2) });
         const dedupe = await ctx.tool({ toolId: "paper_deduplicate", input: { papers: allPapers } });
         const deduped = (dedupe.output as any).papers as PaperHit[];
         const duplicates = (dedupe.output as any).duplicates ?? [];
@@ -944,10 +946,10 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-screening-agent",
       allowedTools: ["artifact_read", "artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "screening_log" }],
-      verifiers: ["artifact_requirements_met", "literature_screening_complete", "literature_screening_topic_anchor_valid"],
+      verifiers: ["artifact_requirements_met", "literature_screening_complete", "literature_screening_topic_anchor_valid", "screening_preferences_complete"],
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
-        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_screening_complete", hardGate: true }, { id: "literature_screening_topic_anchor_valid", hardGate: true }],
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_screening_complete", hardGate: true }, { id: "literature_screening_topic_anchor_valid", hardGate: true }, { id: "screening_preferences_complete", hardGate: true }],
         semantic: { agentId: "literature-reviewer-agent", mode: "always" },
         rules: [
           { when: "hard_gate_failed", action: "retry_stage" },
@@ -961,17 +963,21 @@ export const literatureReviewStageContract: StageContractDefinition = {
       run: async (ctx) => {
         const deduped = (ctx.state.deduped as PaperHit[]) ?? [];
         const agentScreening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
-        if (agentScreening?.decisions) {
+        const agentScreeningHasPreferences = !hasResearchBrief(ctx.metadata) || agentScreening?.decisions?.every((d: any) => typeof d.preferenceScore === "number");
+        if (agentScreening?.decisions && agentScreeningHasPreferences) {
           const screeningDecisions = agentScreening.decisions;
           const screenedIn = screeningDecisions.filter((d: any) => d.decision === "include").map((d: any) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
           return { statePatch: { screeningDecisions, screenedIn } };
         }
         const criteria = ctx.state.criteria ?? defaultCriteria();
         const topicProfile = (ctx.state.topicProfile as TopicProfile | undefined) ?? topicProfileFromQueries(ctx.state.queryPlan, ctx.input, ctx.metadata.topicProfile);
-        const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper, topicProfile));
+        const preferenceScores = deduped.map((paper) => scorePaperAgainstBrief(paper, ctx.metadata, topicProfile));
+        const scoresById = new Map(preferenceScores.map((score) => [score.paperId, score]));
+        const screeningDecisions = deduped.map((paper) => screenPaper(ctx.input, paper, topicProfile, scoresById.get(paper.id)));
         const screenedIn = screeningDecisions.filter((d) => d.decision === "include").map((d) => deduped.find((p) => p.id === d.paperId)!).filter(Boolean);
-        const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, decisions: screeningDecisions }, null, 2) });
-        return { artifactIds: [screeningLog.id], statePatch: { screeningDecisions, screenedIn, screeningLogArtifactId: screeningLog.id } };
+        const preferenceArtifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "preference_scores", summary: summarizePreferenceScores(preferenceScores), scores: preferenceScores }, null, 2) });
+        const screeningLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "screening_log", criteria, preferenceSummary: summarizePreferenceScores(preferenceScores), decisions: screeningDecisions }, null, 2) });
+        return { artifactIds: [preferenceArtifact.id, screeningLog.id], statePatch: { preferenceScores, screeningDecisions, screenedIn, preferenceScoresArtifactId: preferenceArtifact.id, screeningLogArtifactId: screeningLog.id } };
       }
     },
     {
@@ -980,10 +986,10 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-eligibility-agent",
       allowedTools: ["artifact_read", "artifact_write", "evidence_table_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "eligibility_log" }, { type: "json", stage: "quality_assessment" }, { type: "json", stage: "included_studies" }, { type: "json", stage: "evidence_table" }],
-      verifiers: ["artifact_requirements_met", "literature_evidence_complete"],
+      verifiers: ["artifact_requirements_met", "literature_evidence_complete", "eligibility_preferences_enforced"],
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
-        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_evidence_complete", hardGate: true }],
+        deterministic: [{ id: "artifact_requirements_met", hardGate: true }, { id: "literature_evidence_complete", hardGate: true }, { id: "eligibility_preferences_enforced", hardGate: true }],
         semantic: { agentId: "literature-reviewer-agent", mode: "always" },
         rules: [
           { when: "hard_gate_failed", action: "retry_stage" },
@@ -1007,10 +1013,13 @@ export const literatureReviewStageContract: StageContractDefinition = {
           return { statePatch: { eligibilityDecisions: agentEligibility.decisions ?? [], included, quality, evidenceRows, contradictions: [] } };
         }
         const limit = Number(ctx.state.limit ?? 25);
-        const eligibilityDecisions = screenedIn.map((paper) => assessEligibility(paper));
+        const preferenceScores = (ctx.state.preferenceScores as PreferenceScore[]) ?? [];
+        const scoresById = new Map(preferenceScores.map((score) => [score.paperId, score]));
+        const qualityById = new Map(screenedIn.map((paper) => [paper.id, assessQuality(paper, ctx.metadata)]));
+        const eligibilityDecisions = screenedIn.map((paper) => assessEligibility(paper, ctx.metadata, scoresById.get(paper.id), qualityById.get(paper.id)));
         const included = eligibilityDecisions.filter((d) => d.decision === "include").map((d) => screenedIn.find((p) => p.id === d.paperId)!).filter(Boolean).slice(0, Math.min(25, limit));
         const eligibilityLog = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "eligibility_log", decisions: eligibilityDecisions }, null, 2) });
-        const quality = included.map((paper) => assessQuality(paper));
+        const quality = included.map((paper) => qualityById.get(paper.id) ?? assessQuality(paper, ctx.metadata));
         const qualityAssessment = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "quality_assessment", tiers: quality }, null, 2) });
         const includedStudies = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "included_studies", papers: included }, null, 2) });
         const evidenceRows = included.map((paper, index) => ({
@@ -1020,6 +1029,8 @@ export const literatureReviewStageContract: StageContractDefinition = {
           supportType: "context",
           quoteOrSummary: paper.abstract?.slice(0, 700) || `${paper.title} (${paper.year ?? "n.d."})`,
           qualityTier: quality.find((q) => q.paperId === paper.id)?.tier ?? "Tier 3",
+          preferenceAlignment: preferenceAlignment(scoresById.get(paper.id)),
+          briefTrace: scoresById.get(paper.id)?.briefTrace ?? [],
           confidence: paper.abstract ? 0.72 : 0.52
         }));
         const evidence = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "evidence_table", researchQuestion: ctx.input, rows: evidenceRows }, null, 2) });
@@ -1034,13 +1045,14 @@ export const literatureReviewStageContract: StageContractDefinition = {
       agentId: "literature-synthesis-agent",
       allowedTools: ["citation_verify", "bibtex_write", "prisma_flow_write", "artifact_read", "artifact_write", "finalize"],
       requiredArtifacts: [{ type: "json", stage: "citation_verification" }, { type: "json", stage: "prisma_flow" }, { type: "markdown", minCount: 2 }],
-      verifiers: ["artifact_requirements_met", "literature_prisma_counts_valid", "no_open_blocking_findings"],
+      verifiers: ["artifact_requirements_met", "literature_prisma_counts_valid", "synthesis_preferences_reflected", "no_open_blocking_findings"],
       review: { agentId: "literature-reviewer-agent", mode: "always" },
       retryPolicy: { maxAttempts: 2, onFailure: "retry_stage" },
       gate: {
         deterministic: [
           { id: "artifact_requirements_met", hardGate: true },
           { id: "literature_prisma_counts_valid", hardGate: true },
+          { id: "synthesis_preferences_reflected", hardGate: true },
           { id: "no_open_blocking_findings", hardGate: true }
         ],
         semantic: { agentId: "literature-reviewer-agent", mode: "always" },
@@ -1070,6 +1082,7 @@ export const literatureReviewStageContract: StageContractDefinition = {
         const quality = (ctx.state.quality as any[]) ?? [];
         const evidenceRows = (ctx.state.evidenceRows as any[]) ?? [];
         const contradictions = (ctx.state.contradictions as any[]) ?? [];
+        const preferenceScores = (ctx.state.preferenceScores as PreferenceScore[]) ?? [];
         const citationVerification = await ctx.tool({ toolId: "citation_verify", input: { papers: included } });
         const citationVerificationArtifactId = (citationVerification.output as any).artifactId as string;
         const bibtex = await ctx.tool({ toolId: "bibtex_write", input: { papers: included } });
@@ -1093,14 +1106,16 @@ export const literatureReviewStageContract: StageContractDefinition = {
         };
         const prismaFlow = await ctx.tool({ toolId: "prisma_flow_write", input: prisma });
         const prismaFlowArtifactId = (prismaFlow.output as any).artifactId as string;
-        const synthesisText = renderSynthesis(ctx.input, included, evidenceRows, quality, contradictions, prisma);
+        const synthesisText = renderSynthesis(ctx.input, included, evidenceRows, quality, contradictions, prisma, ctx.metadata, preferenceScores);
         const synthesis = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: synthesisText });
         const reviewFindings = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "review_findings", findings: reviewFindingsTree, summary: reviewFindingsTree.length ? "Open review findings from the session tree are listed here and must be resolved or accepted before treating the report as final." : "No open review findings were present before final semantic review." }, null, 2) });
-        const finalReport = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: `${synthesisText}\n\n## Artifact Index\n\n- protocol.json: ${ctx.state.protocolArtifactId}\n- queries.json: ${ctx.state.queriesArtifactId}\n- identification.json: ${ctx.state.identificationArtifactId}\n- citation_chaining.json: ${ctx.state.citationChainArtifactId}\n- deduped_papers.json: ${ctx.state.dedupedArtifactId}\n- screening_log.json: ${ctx.state.screeningLogArtifactId}\n- eligibility_log.json: ${ctx.state.eligibilityLogArtifactId}\n- quality_assessment.json: ${ctx.state.qualityAssessmentArtifactId}\n- included_studies.json: ${ctx.state.includedStudiesArtifactId}\n- evidence_table.json: ${ctx.state.evidenceArtifactId}\n- contradiction_detection.json: ${ctx.state.contradictionArtifactId}\n- citation_verification.json: ${citationVerificationArtifactId}\n- bibtex.bib: ${bibtexArtifactId}\n- prisma_flow.json: ${prismaFlowArtifactId}\n- review_findings.json: ${reviewFindings.id}\n` });
+        const finalReport = await ctx.createArtifact({ type: "markdown", mediaType: "text/markdown", content: `${synthesisText}\n\n## Artifact Index\n\n- research_brief.json: ${ctx.state.researchBriefArtifactId ?? "not provided"}\n- protocol.json: ${ctx.state.protocolArtifactId}\n- queries.json: ${ctx.state.queriesArtifactId}\n- identification.json: ${ctx.state.identificationArtifactId}\n- citation_chaining.json: ${ctx.state.citationChainArtifactId}\n- deduped_papers.json: ${ctx.state.dedupedArtifactId}\n- preference_scores.json: ${ctx.state.preferenceScoresArtifactId ?? "not generated"}\n- screening_log.json: ${ctx.state.screeningLogArtifactId}\n- eligibility_log.json: ${ctx.state.eligibilityLogArtifactId}\n- quality_assessment.json: ${ctx.state.qualityAssessmentArtifactId}\n- included_studies.json: ${ctx.state.includedStudiesArtifactId}\n- evidence_table.json: ${ctx.state.evidenceArtifactId}\n- contradiction_detection.json: ${ctx.state.contradictionArtifactId}\n- citation_verification.json: ${citationVerificationArtifactId}\n- bibtex.bib: ${bibtexArtifactId}\n- prisma_flow.json: ${prismaFlowArtifactId}\n- review_findings.json: ${reviewFindings.id}\n` });
         await ctx.recordProvenance({
           nodes: [
             { type: "artifact", refId: finalReport.id, label: "final_report.md" },
             { type: "artifact", refId: synthesis.id, label: "synthesis.md" },
+            ...(ctx.state.researchBriefArtifactId ? [{ type: "artifact", refId: String(ctx.state.researchBriefArtifactId), label: "research_brief.json" }] : []),
+            ...(ctx.state.preferenceScoresArtifactId ? [{ type: "artifact", refId: String(ctx.state.preferenceScoresArtifactId), label: "preference_scores.json" }] : []),
             { type: "artifact", refId: String(ctx.state.evidenceArtifactId), label: "evidence_table.json" },
             { type: "artifact", refId: prismaFlowArtifactId, label: "prisma_flow.json" },
             ...included.map((paper) => ({ type: "source", refId: paper.id, label: paper.title, metadata: { doi: paper.doi, url: paper.url, sourceDb: paper.sourceDb } })),
@@ -1108,6 +1123,8 @@ export const literatureReviewStageContract: StageContractDefinition = {
           ],
           edges: [
             { type: "derived_from", fromRef: synthesis.id, toRef: finalReport.id },
+            ...(ctx.state.researchBriefArtifactId ? [{ type: "constrains", fromRef: String(ctx.state.researchBriefArtifactId), toRef: String(ctx.state.preferenceScoresArtifactId ?? synthesis.id) }] : []),
+            ...(ctx.state.preferenceScoresArtifactId ? [{ type: "constrains", fromRef: String(ctx.state.preferenceScoresArtifactId), toRef: String(ctx.state.evidenceArtifactId) }] : []),
             { type: "derived_from", fromRef: String(ctx.state.evidenceArtifactId), toRef: synthesis.id },
             { type: "derived_from", fromRef: prismaFlowArtifactId, toRef: finalReport.id },
             ...evidenceRows.map((row) => ({ type: "supports", fromRef: row.paperId, toRef: row.evidenceId })),
@@ -1136,7 +1153,65 @@ function defaultCriteria() {
   };
 }
 
+async function ensureResearchBriefArtifact(ctx: any): Promise<Artifact | null> {
+  if (!hasResearchBrief(ctx.metadata)) return null;
+  const existing = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+  if (existing) return null;
+  return ctx.createArtifact({
+    type: "json",
+    mediaType: "application/json",
+    content: JSON.stringify({
+      stage: "research_brief",
+      researchQuestion: ctx.input,
+      researchBrief: ctx.metadata.researchBrief,
+      compiledMetadata: compactObject({
+        topicProfile: ctx.metadata.topicProfile,
+        sourcePreferences: ctx.metadata.sourcePreferences,
+        evidencePreferences: ctx.metadata.evidencePreferences,
+        outputPreferences: ctx.metadata.outputPreferences,
+        inclusionCriteria: ctx.metadata.inclusionCriteria,
+        exclusionCriteria: ctx.metadata.exclusionCriteria,
+        dbs: ctx.metadata.dbs,
+        limit: ctx.metadata.limit
+      }),
+      audit: {
+        source: "runtime metadata",
+        createdByStage: "protocol_query",
+        note: "This artifact freezes the user brief and compiled metadata used by downstream screening, eligibility, and synthesis checks."
+      }
+    }, null, 2)
+  });
+}
+
+function hasResearchBrief(metadata: any): boolean {
+  return Boolean(metadata?.researchBrief);
+}
+
+function compactObject(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null));
+}
+
+function protocolPreferenceSummary(metadata: any): any {
+  return compactObject({
+    sourcePreferences: metadata?.sourcePreferences,
+    evidencePreferences: metadata?.evidencePreferences,
+    outputPreferences: metadata?.outputPreferences,
+    inclusionCriteria: metadata?.inclusionCriteria,
+    exclusionCriteria: metadata?.exclusionCriteria
+  });
+}
+
 const literatureStageVerifiers: StageVerifierDefinition[] = [
+  {
+    id: "brief_metadata_valid",
+    description: "Validate that a compiled user research brief is captured as an auditable artifact when provided.",
+    async verify(ctx) {
+      const brief = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+      if (!brief) return { ok: true, message: "No research brief artifact was required or provided." };
+      const ok = Boolean(brief.researchQuestion && brief.researchBrief && brief.compiledMetadata?.topicProfile);
+      return ok ? { ok: true, message: "Research brief metadata is captured." } : { ok: false, message: "Research brief artifact is missing question, original brief, or compiled topic profile.", severity: "major", category: "brief_metadata_invalid" };
+    }
+  },
   {
     id: "literature_protocol_valid",
     description: "Validate literature protocol and query-plan artifacts.",
@@ -1210,6 +1285,19 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
     }
   },
   {
+    id: "screening_preferences_complete",
+    description: "Validate that screening decisions expose preference scores when a research brief is present.",
+    async verify(ctx) {
+      const brief = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+      if (!brief) return { ok: true, message: "No research brief preferences to enforce." };
+      const screening = await readStageArtifact(ctx.services, ctx.artifactIds, "screening_log");
+      const scores = await readStageArtifact(ctx.services, ctx.artifactIds, "preference_scores");
+      const decisions = screening?.decisions ?? [];
+      const ok = Array.isArray(scores?.scores) && scores.scores.length === decisions.length && decisions.every((d: any) => typeof d.preferenceScore === "number" && Array.isArray(d.preferenceReasons) && !(d.decision === "include" && d.hardExcluded));
+      return ok ? { ok: true, message: "Screening decisions include auditable preference scores." } : { ok: false, message: "Screening decisions are missing preference scores or included hard-excluded records.", severity: "major", category: "screening_preferences_incomplete" };
+    }
+  },
+  {
     id: "literature_evidence_complete",
     description: "Validate included studies, quality tiers, and evidence rows.",
     async verify(ctx) {
@@ -1225,6 +1313,25 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
     }
   },
   {
+    id: "eligibility_preferences_enforced",
+    description: "Validate bottom-line evidence preferences such as DOI, abstract, and minimum quality.",
+    async verify(ctx) {
+      const brief = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+      if (!brief) return { ok: true, message: "No research brief evidence preferences to enforce." };
+      const included = await readStageArtifact(ctx.services, ctx.artifactIds, "included_studies");
+      const eligibility = await readStageArtifact(ctx.services, ctx.artifactIds, "eligibility_log");
+      const quality = await readStageArtifact(ctx.services, ctx.artifactIds, "quality_assessment");
+      const evidencePreferences = brief.compiledMetadata?.evidencePreferences ?? {};
+      const papers = included?.papers ?? [];
+      const tiers = quality?.tiers ?? [];
+      const minQuality = evidencePreferences.min_quality ?? evidencePreferences.minQuality;
+      const bad = papers.filter((paper: PaperHit) => (evidencePreferences.require_doi || evidencePreferences.requireDoi) && !paper.doi || (evidencePreferences.require_abstract || evidencePreferences.requireAbstract) && !paper.abstract);
+      const weak = minQuality ? tiers.filter((tier: any) => !meetsMinQuality(tier.tier, minQuality)) : [];
+      const ok = Array.isArray(eligibility?.decisions) && bad.length === 0 && weak.length === 0;
+      return ok ? { ok: true, message: "Eligibility preferences are enforced." } : { ok: false, message: "Included studies violate evidence preferences for DOI, abstract, or minimum quality.", severity: "blocking", category: "eligibility_preferences_failed" };
+    }
+  },
+  {
     id: "literature_prisma_counts_valid",
     description: "Validate PRISMA flow arithmetic.",
     async verify(ctx) {
@@ -1237,6 +1344,19 @@ const literatureStageVerifiers: StageVerifierDefinition[] = [
       const included = Number(prisma.studiesIncludedInSynthesis ?? -1);
       const ok = Number(prisma.totalRecordsIdentified) === total && after + duplicates === total && screened === after && included >= 0 && included <= screened;
       return ok ? { ok: true, message: "PRISMA counts are valid." } : { ok: false, message: "PRISMA counts are arithmetically inconsistent.", severity: "major", category: "prisma_count_mismatch" };
+    }
+  },
+  {
+    id: "synthesis_preferences_reflected",
+    description: "Validate that the final synthesis reflects the user brief and preference artifacts.",
+    async verify(ctx) {
+      const brief = await readStageArtifact(ctx.services, ctx.artifactIds, "research_brief");
+      if (!brief) return { ok: true, message: "No research brief preferences to reflect." };
+      const markdown = await listArtifactsByType(ctx.services, ctx.artifactIds, "markdown");
+      const latest = markdown.at(-1);
+      const text = latest ? (await ctx.services.artifactStore.read(latest.id)).toString("utf8") : "";
+      const ok = /User Preferences|用户偏好/i.test(text) && /preference_scores\.json/.test(text);
+      return ok ? { ok: true, message: "Synthesis reflects user preferences and audit artifacts." } : { ok: false, message: "Final synthesis does not expose user preferences or preference score artifact references.", severity: "major", category: "synthesis_preferences_missing" };
     }
   }
 ];
@@ -1366,6 +1486,29 @@ type TopicProfile = {
   coreTerms: string[];
   domainTerms: string[];
   modifierTerms: string[];
+};
+
+type PreferenceScore = {
+  paperId: string;
+  hardExcluded: boolean;
+  score: number;
+  topicScore: number;
+  sourceScore: number;
+  evidenceScore: number;
+  focusScore: number;
+  reasons: string[];
+  penalties: string[];
+  hardExclusions: string[];
+  appliedPreferences: string[];
+  briefTrace: string[];
+  matched: {
+    questions: string[];
+    domains: string[];
+    institutions: string[];
+    geographies: string[];
+    sources: string[];
+    studyTypes: string[];
+  };
 };
 
 function buildQueryPlan(question: string, dbs: string[], criteria: unknown, metadataProfile?: unknown): any {
@@ -1533,33 +1676,141 @@ function topicAnchorScore(paper: PaperHit, profile: TopicProfile): { anchored: b
   return { anchored, score, coreHits, domainHits, modifierHits };
 }
 
-function screenPaper(_question: string, paper: PaperHit, profile: TopicProfile): any {
+function scorePaperAgainstBrief(paper: PaperHit, metadata: any, profile: TopicProfile): PreferenceScore {
   const anchor = topicAnchorScore(paper, profile);
-  const decision = anchor.anchored && anchor.score >= 1.5 ? "include" : "exclude";
+  const sourcePrefs = metadata?.sourcePreferences ?? {};
+  const evidencePrefs = metadata?.evidencePreferences ?? {};
+  const brief = metadata?.researchBrief ?? {};
+  const text = paperSearchText(paper);
+  const reasons: string[] = [];
+  const penalties: string[] = [];
+  const hardExclusions: string[] = [];
+  const appliedPreferences: string[] = [];
+  const matched = {
+    questions: matchedTerms(text, termsOf(brief?.questions)),
+    domains: matchedTerms(text, uniqueQueries([...termsOf(sourcePrefs?.domains), ...profile.domainTerms])),
+    institutions: matchedTerms(text, termsOf(sourcePrefs?.institutions)),
+    geographies: matchedTerms(text, termsOf(sourcePrefs?.geographies)),
+    sources: matchedTerms(`${paper.sourceDb} ${paper.venue ?? ""} ${paper.url ?? ""}`, termsOf(sourcePrefs?.preferredSources)),
+    studyTypes: matchedStudyTypes(text, termsOf(evidencePrefs?.studyTypes ?? evidencePrefs?.study_types))
+  };
+
+  const dateRange = sourcePrefs?.dateRange ?? sourcePrefs?.date_range;
+  if (dateRange && !paperYearInRange(paper.year, dateRange)) hardExclusions.push(`outside date range ${dateRange.from ?? "any"}-${dateRange.to ?? "any"}`);
+  for (const term of matchedTerms(text, exclusionTerms(metadata))) hardExclusions.push(`matched exclusion term: ${term}`);
+  if ((evidencePrefs?.requireDoi || evidencePrefs?.require_doi) && !paper.doi) hardExclusions.push("missing required DOI");
+  if ((evidencePrefs?.requireAbstract || evidencePrefs?.require_abstract) && !paper.abstract) hardExclusions.push("missing required abstract");
+  const excludedSourceHits = matchedTerms(`${paper.sourceDb} ${paper.venue ?? ""} ${paper.url ?? ""} ${paper.title}`, termsOf(sourcePrefs?.excludedSources ?? sourcePrefs?.excluded_sources));
+  for (const term of excludedSourceHits) hardExclusions.push(`matched excluded source: ${term}`);
+
+  let sourceScore = 0;
+  let focusScore = 0;
+  let evidenceScore = 0;
+  if (matched.sources.length) {
+    sourceScore += matched.sources.length * 1.5;
+    reasons.push(`preferred source match: ${matched.sources.join(", ")}`);
+    appliedPreferences.push("sourcePreferences.preferredSources");
+  }
+  if (matched.domains.length) {
+    focusScore += matched.domains.length * 1.2;
+    reasons.push(`domain focus match: ${matched.domains.join(", ")}`);
+    appliedPreferences.push("sourcePreferences.domains/topicProfile.domainTerms");
+  }
+  if (matched.institutions.length) {
+    focusScore += matched.institutions.length * 1.1;
+    reasons.push(`institution focus match: ${matched.institutions.join(", ")}`);
+    appliedPreferences.push("sourcePreferences.institutions");
+  }
+  if (matched.geographies.length) {
+    focusScore += matched.geographies.length * 0.8;
+    reasons.push(`geography focus match: ${matched.geographies.join(", ")}`);
+    appliedPreferences.push("sourcePreferences.geographies");
+  }
+  if (matched.studyTypes.length) {
+    evidenceScore += matched.studyTypes.length;
+    reasons.push(`evidence type match: ${matched.studyTypes.join(", ")}`);
+    appliedPreferences.push("evidencePreferences.studyTypes");
+  }
+  if (paper.doi) evidenceScore += 0.3;
+  else if (evidencePrefs?.requireDoi || evidencePrefs?.require_doi) penalties.push("DOI required but absent");
+  if (paper.abstract) evidenceScore += 0.5;
+  else if (evidencePrefs?.requireAbstract || evidencePrefs?.require_abstract) penalties.push("abstract required but absent");
+  if (dateRange) appliedPreferences.push("sourcePreferences.dateRange");
+  if (hardExclusions.length) penalties.push(...hardExclusions);
+
+  const score = Math.max(0, anchor.score + sourceScore + focusScore + evidenceScore - penalties.length * 0.5);
+  if (!reasons.length) reasons.push(anchor.anchored ? "topic anchor matched" : "no explicit user preference match");
+  return {
+    paperId: paper.id,
+    hardExcluded: hardExclusions.length > 0,
+    score: Number(score.toFixed(2)),
+    topicScore: Number(anchor.score.toFixed(2)),
+    sourceScore: Number(sourceScore.toFixed(2)),
+    evidenceScore: Number(evidenceScore.toFixed(2)),
+    focusScore: Number(focusScore.toFixed(2)),
+    reasons,
+    penalties,
+    hardExclusions,
+    appliedPreferences: uniqueQueries(appliedPreferences),
+    briefTrace: uniqueQueries([
+      ...matched.questions.map((term) => `question:${term}`),
+      ...matched.domains.map((term) => `domain:${term}`),
+      ...matched.institutions.map((term) => `institution:${term}`),
+      ...matched.geographies.map((term) => `geography:${term}`),
+      ...matched.sources.map((term) => `source:${term}`),
+      ...matched.studyTypes.map((term) => `studyType:${term}`)
+    ]),
+    matched
+  };
+}
+
+function screenPaper(_question: string, paper: PaperHit, profile: TopicProfile, preference?: PreferenceScore): any {
+  const anchor = topicAnchorScore(paper, profile);
+  const hardExcluded = preference?.hardExcluded ?? false;
+  const decision = !hardExcluded && anchor.anchored && anchor.score >= 1.5 ? "include" : "exclude";
   return {
     paperId: paper.id,
     title: paper.title,
     decision,
-    criteria: decision === "include" ? ["IC1", paper.abstract ? "IC2" : "IC3"] : ["EC1"],
+    criteria: decision === "include" ? ["IC1", paper.abstract ? "IC2" : "IC3"] : hardExcluded ? ["EC_user_preference"] : ["EC1"],
     reason: decision === "include"
       ? `Included: matched topic anchors. Core hits: ${anchor.coreHits.join(", ") || "none"}; domain hits: ${anchor.domainHits.join(", ") || "none"}.`
-      : `Excluded: no sufficient topic anchor. Modifier-only hits: ${anchor.modifierHits.join(", ") || "none"}.`,
+      : hardExcluded ? `Excluded by user brief hard filters: ${preference?.hardExclusions.join("; ")}` : `Excluded: no sufficient topic anchor. Modifier-only hits: ${anchor.modifierHits.join(", ") || "none"}.`,
+    hardExcluded,
+    hardExclusions: preference?.hardExclusions ?? [],
+    preferenceScore: preference?.score ?? Number(anchor.score.toFixed(2)),
+    preferenceReasons: preference?.reasons ?? [],
+    preferencePenalties: preference?.penalties ?? [],
+    briefTrace: preference?.briefTrace ?? [],
     confidence: Math.min(0.95, Math.max(0.35, anchor.score / 4))
   };
 }
 
-function assessEligibility(paper: PaperHit): any {
+function assessEligibility(paper: PaperHit, metadata: any = {}, preference?: PreferenceScore, quality?: any): any {
   const hasIdentity = Boolean(paper.title && (paper.doi || paper.url || paper.id));
   const hasEvidence = Boolean(paper.abstract || paper.venue || paper.year);
+  const evidencePrefs = metadata?.evidencePreferences ?? {};
+  const reasons: string[] = [];
+  if (!hasIdentity) reasons.push("insufficient source identity");
+  if (!hasEvidence) reasons.push("insufficient evidence metadata");
+  if (preference?.hardExcluded) reasons.push(...preference.hardExclusions);
+  if ((evidencePrefs?.requireDoi || evidencePrefs?.require_doi) && !paper.doi) reasons.push("required DOI missing");
+  if ((evidencePrefs?.requireAbstract || evidencePrefs?.require_abstract) && !paper.abstract) reasons.push("required abstract missing");
+  const minQuality = evidencePrefs?.minQuality ?? evidencePrefs?.min_quality;
+  if (minQuality && quality?.tier && !meetsMinQuality(quality.tier, minQuality)) reasons.push(`quality ${quality.tier} below required ${minQuality}`);
+  const include = hasIdentity && hasEvidence && reasons.length === 0;
   return {
     paperId: paper.id,
-    decision: hasIdentity && hasEvidence ? "include" : "exclude",
-    reason: hasIdentity && hasEvidence ? "Eligible: identifiable scholarly record with usable metadata or abstract." : "Excluded: insufficient source identity or evidence metadata.",
-    assessedUsing: paper.abstract ? "abstract" : "metadata"
+    decision: include ? "include" : "exclude",
+    reason: include ? "Eligible: identifiable scholarly record with usable metadata or abstract and no brief hard-filter violations." : `Excluded: ${reasons.join("; ")}.`,
+    assessedUsing: paper.abstract ? "abstract" : "metadata",
+    appliedPreferences: preference?.appliedPreferences ?? [],
+    preferenceScore: preference?.score,
+    qualityTier: quality?.tier
   };
 }
 
-function assessQuality(paper: PaperHit): any {
+function assessQuality(paper: PaperHit, _metadata: any = {}): any {
   const venue = (paper.venue ?? "").toLowerCase();
   const isPreprint = /arxiv|biorxiv|medrxiv/.test(venue) || ["arxiv", "biorxiv", "medrxiv"].includes(paper.sourceDb);
   const highCitation = Number(paper.citationCount ?? 0) >= 100;
@@ -1569,6 +1820,79 @@ function assessQuality(paper: PaperHit): any {
     tier,
     justification: tier === "Tier 1" ? "Peer-reviewed or curated source with high citation signal." : tier === "Tier 2" ? "Identifiable non-preprint venue or curated database record." : tier === "Tier 3" ? "Preprint or preliminary record with abstract-level evidence." : "Weak metadata-only evidence."
   };
+}
+
+function paperSearchText(paper: PaperHit): string {
+  return normalizeText(`${paper.title} ${paper.abstract ?? ""} ${paper.venue ?? ""} ${paper.sourceDb} ${(paper.authors ?? []).join(" ")} ${paper.url ?? ""}`);
+}
+
+function matchedTerms(haystack: string, terms: string[]): string[] {
+  const normalized = normalizeText(haystack);
+  return uniqueQueries(terms).filter((term) => normalized.includes(normalizeText(term)));
+}
+
+function matchedStudyTypes(haystack: string, studyTypes: string[]): string[] {
+  const patterns: Record<string, RegExp> = {
+    review: /\b(review|survey|systematic review|meta-analysis|roadmap)\b/i,
+    survey: /\b(survey|review)\b/i,
+    benchmark: /\b(benchmark|leaderboard|evaluation|comparison)\b/i,
+    empirical: /\b(empirical|experiment|case study|observational|evaluation)\b/i,
+    clinical: /\b(clinical|trial|patient|cohort)\b/i,
+    experiment: /\b(experiment|experimental|ablation)\b/i
+  };
+  return uniqueQueries(studyTypes).filter((type) => (patterns[normalizeText(type)] ?? new RegExp(escapeRegExp(type), "i")).test(haystack));
+}
+
+function exclusionTerms(metadata: any): string[] {
+  return uniqueQueries([
+    ...termsOf(metadata?.exclusionCriteria),
+    ...termsOf(metadata?.researchBrief?.scope?.exclude),
+    ...termsOf(metadata?.researchBrief?.exclusionCriteria)
+  ]);
+}
+
+function paperYearInRange(year: number | undefined, range: any): boolean {
+  if (!year) return true;
+  const from = Number(range?.from ?? range?.start ?? Number.NEGATIVE_INFINITY);
+  const to = Number(range?.to ?? range?.end ?? Number.POSITIVE_INFINITY);
+  return year >= from && year <= to;
+}
+
+function qualityRank(tier: string): number {
+  const match = String(tier ?? "").match(/tier\s*(\d+)/i);
+  return match ? Number(match[1]) : 4;
+}
+
+function meetsMinQuality(tier: string, minQuality: string): boolean {
+  return qualityRank(tier) <= qualityRank(minQuality);
+}
+
+function preferenceAlignment(score?: PreferenceScore): any {
+  if (!score) return { score: 0, reasons: [] };
+  return {
+    score: score.score,
+    topicScore: score.topicScore,
+    sourceScore: score.sourceScore,
+    evidenceScore: score.evidenceScore,
+    focusScore: score.focusScore,
+    reasons: score.reasons,
+    matched: score.matched
+  };
+}
+
+function summarizePreferenceScores(scores: PreferenceScore[]): any {
+  const hardExcluded = scores.filter((score) => score.hardExcluded).length;
+  const averageScore = scores.length ? scores.reduce((sum, score) => sum + score.score, 0) / scores.length : 0;
+  return {
+    recordsScored: scores.length,
+    hardExcluded,
+    averageScore: Number(averageScore.toFixed(2)),
+    topPreferenceMatches: [...scores].sort((a, b) => b.score - a.score).slice(0, 5).map((score) => ({ paperId: score.paperId, score: score.score, reasons: score.reasons }))
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function detectContradictions(rows: any[]): any[] {
@@ -1590,14 +1914,37 @@ function renderBibtex(paper: PaperHit, index: number): string {
   return `@${type}{${key},\n  title = {${paper.title.replace(/[{}]/g, "")}},\n  author = {${(paper.authors ?? ["Unknown"]).join(" and ")}},\n  year = {${paper.year ?? "n.d."}},\n  journal = {${paper.venue ?? paper.sourceDb}},\n  doi = {${paper.doi ?? ""}},\n  url = {${paper.url ?? ""}}\n}`;
 }
 
-function renderSynthesis(question: string, papers: PaperHit[], rows: any[], quality: any[], contradictions: any[], prisma: any): string {
+function renderSynthesis(question: string, papers: PaperHit[], rows: any[], quality: any[], contradictions: any[], prisma: any, metadata: any = {}, preferenceScores: PreferenceScore[] = []): string {
   const refs = papers.map((p, i) => `${i + 1}. ${p.authors?.slice(0, 3).join(", ") || "Unknown"} (${p.year ?? "n.d."}). ${p.title}. ${p.venue ?? p.sourceDb}. ${p.doi ? `doi:${p.doi}` : p.url ?? p.id}`).join("\n");
   const claims = rows.map((r, i) => `- **Finding ${i + 1}**: ${r.claim} Evidence: ${r.evidenceId}; source: ${r.paperId}; quality: ${r.qualityTier}.`).join("\n");
   const matrix = papers.map((p) => {
     const q = quality.find((x) => x.paperId === p.id);
     return `| ${p.title.replace(/\|/g, " ")} | ${p.year ?? "n.d."} | ${p.venue ?? p.sourceDb} | ${q?.tier ?? "Tier 3"} | ${p.abstract ? p.abstract.slice(0, 120).replace(/\|/g, " ") : "Metadata-level relevance"} |`;
   }).join("\n");
-  return `# PRISMA-Style Literature Review: ${question}\n\n## PRISMA Flow\n\n- Records identified through database searching: ${prisma.recordsIdentifiedThroughDatabaseSearching}\n- Records identified through citation chaining: ${prisma.recordsIdentifiedThroughCitationChaining}\n- Citation-chain hints found but not promoted to screened records: ${prisma.citationChainHintsFound ?? 0}\n- Records after deduplication: ${prisma.recordsAfterDeduplication}\n- Records screened: ${prisma.recordsScreened}\n- Records excluded during title/abstract screening: ${prisma.recordsExcludedTitleAbstract}\n- Full-text/abstract records assessed for eligibility: ${prisma.fullTextOrAbstractRecordsAssessed}\n- Records excluded at eligibility: ${prisma.recordsExcludedEligibility}\n- Studies included in synthesis: ${prisma.studiesIncludedInSynthesis}\n\n## Summary\n\nThis review searched registered scholarly databases, deduplicated records, screened title/abstract metadata against explicit criteria, assessed eligibility using available abstract/full metadata, assigned evidence quality tiers, verified citation metadata, and synthesized evidence rows into traceable findings.\n\n## Key Findings\n\n${claims || "- No included papers were available for synthesis."}\n\n## Contradictions & Conflicts\n\n${contradictions.length ? contradictions.map((c) => `- ${c.type}: ${c.explanation}`).join("\n") : "- No explicit contradictions detected by automated v0 scan."}\n\n## Evidence Matrix\n\n| Paper | Year | Venue | Quality Tier | Key Finding |\n|---|---:|---|---|---|\n${matrix || "| No included papers | | | | |"}\n\n## References\n\n${refs || "No verified references returned."}\n\n## Gaps & Opportunities\n\n- Full-text retrieval and section-level extraction should be added for stronger eligibility assessment.\n- Citation chaining is represented, but connector-level reference expansion should be broadened where APIs permit.\n- Manual expert review remains necessary before treating this as a formal systematic review.\n`;
+  const preferenceSummary = renderPreferenceSummary(metadata, preferenceScores);
+  return `# PRISMA-Style Literature Review: ${question}\n\n## PRISMA Flow\n\n- Records identified through database searching: ${prisma.recordsIdentifiedThroughDatabaseSearching}\n- Records identified through citation chaining: ${prisma.recordsIdentifiedThroughCitationChaining}\n- Citation-chain hints found but not promoted to screened records: ${prisma.citationChainHintsFound ?? 0}\n- Records after deduplication: ${prisma.recordsAfterDeduplication}\n- Records screened: ${prisma.recordsScreened}\n- Records excluded during title/abstract screening: ${prisma.recordsExcludedTitleAbstract}\n- Full-text/abstract records assessed for eligibility: ${prisma.fullTextOrAbstractRecordsAssessed}\n- Records excluded at eligibility: ${prisma.recordsExcludedEligibility}\n- Studies included in synthesis: ${prisma.studiesIncludedInSynthesis}\n\n## Summary\n\nThis review searched registered scholarly databases, deduplicated records, screened title/abstract metadata against explicit criteria, assessed eligibility using available abstract/full metadata, assigned evidence quality tiers, verified citation metadata, and synthesized evidence rows into traceable findings.\n\n${preferenceSummary}\n\n## Key Findings\n\n${claims || "- No included papers were available for synthesis."}\n\n## Contradictions & Conflicts\n\n${contradictions.length ? contradictions.map((c) => `- ${c.type}: ${c.explanation}`).join("\n") : "- No explicit contradictions detected by automated v0 scan."}\n\n## Evidence Matrix\n\n| Paper | Year | Venue | Quality Tier | Key Finding |\n|---|---:|---|---|---|\n${matrix || "| No included papers | | | | |"}\n\n## References\n\n${refs || "No verified references returned."}\n\n## Gaps & Opportunities\n\n- Full-text retrieval and section-level extraction should be added for stronger eligibility assessment.\n- Citation chaining is represented, but connector-level reference expansion should be broadened where APIs permit.\n- Manual expert review remains necessary before treating this as a formal systematic review.\n`;
+}
+
+function renderPreferenceSummary(metadata: any, preferenceScores: PreferenceScore[]): string {
+  if (!hasResearchBrief(metadata)) return "## User Preferences\n\n- No structured research brief was provided; screening used the inferred topic profile and default PRISMA-style criteria.";
+  const sourcePrefs = metadata?.sourcePreferences ?? {};
+  const evidencePrefs = metadata?.evidencePreferences ?? {};
+  const outputPrefs = metadata?.outputPreferences ?? {};
+  const summary = summarizePreferenceScores(preferenceScores);
+  const dateRange = sourcePrefs?.dateRange ?? sourcePrefs?.date_range;
+  const lines = [
+    `- Structured brief captured in research_brief.json; paper-level scoring captured in preference_scores.json.`,
+    `- Records scored against preferences: ${summary.recordsScored}; hard-excluded by brief filters: ${summary.hardExcluded}.`,
+    dateRange ? `- Date range preference: ${dateRange.from ?? "any"} to ${dateRange.to ?? "any"}.` : undefined,
+    termsOf(sourcePrefs?.preferredSources).length ? `- Preferred sources: ${termsOf(sourcePrefs.preferredSources).join(", ")}.` : undefined,
+    termsOf(sourcePrefs?.institutions).length ? `- Institution focus: ${termsOf(sourcePrefs.institutions).join(", ")}.` : undefined,
+    termsOf(sourcePrefs?.domains).length ? `- Domain focus: ${termsOf(sourcePrefs.domains).join(", ")}.` : undefined,
+    evidencePrefs?.requireDoi || evidencePrefs?.require_doi ? "- DOI was treated as a hard evidence requirement." : undefined,
+    evidencePrefs?.requireAbstract || evidencePrefs?.require_abstract ? "- Abstract availability was treated as a hard evidence requirement." : undefined,
+    evidencePrefs?.minQuality || evidencePrefs?.min_quality ? `- Minimum quality tier: ${evidencePrefs.minQuality ?? evidencePrefs.min_quality}.` : undefined,
+    outputPrefs?.language ? `- Requested output language: ${outputPrefs.language}.` : undefined
+  ].filter(Boolean);
+  return `## User Preferences\n\n${lines.join("\n")}`;
 }
 
 export const literaturePack: CapabilityPack = {

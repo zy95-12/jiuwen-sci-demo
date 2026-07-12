@@ -517,6 +517,78 @@ test("AI4S literature screening excludes modifier-only trend papers", async () =
   }
 });
 
+test("literature research brief preferences are audited and enforced", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    getLiteratureConnectorRegistry(runtime.services).register({
+      id: "fake-brief-pref",
+      name: "Fake Brief Preferences",
+      description: "Fake connector for research brief preference tests",
+      async search() {
+        return [
+          { id: "brief-good", title: "AI for Science review from DeepMind on foundation models", authors: ["DeepMind Research"], year: 2025, venue: "Nature Reviews", doi: "10.0000/good", url: "https://example.test/good", sourceDb: "fake-brief-pref", citationCount: 120, abstract: "This review surveys AI for Science, foundation models, scientific discovery, and autonomous laboratories." },
+          { id: "brief-old", title: "AI for Science early survey", authors: ["A"], year: 2018, venue: "Journal", doi: "10.0000/old", url: "https://example.test/old", sourceDb: "fake-brief-pref", abstract: "AI for Science and scientific discovery before the requested date range." },
+          { id: "brief-no-doi", title: "AI for Science foundation model benchmark", authors: ["B"], year: 2024, venue: "arXiv", url: "https://example.test/no-doi", sourceDb: "fake-brief-pref", abstract: "A benchmark for foundation models in scientific discovery." }
+        ];
+      }
+    });
+    const result = await runtime.run({
+      input: "AI4S的发展现状和趋势",
+      strategy: "workflow_controlled",
+      metadata: {
+        workflow: "literature-review",
+        dbs: ["fake-brief-pref"],
+        limit: 3,
+        researchBrief: {
+          topic: "AI4S的发展现状和趋势",
+          questions: ["AI for Science foundation models", "autonomous laboratories"],
+          scope: { include: ["foundation models"], exclude: ["policy commentary"] }
+        },
+        topicProfile: {
+          topicLabel: "AI4S",
+          coreTerms: ["AI4S", "AI for Science", "scientific discovery"],
+          domainTerms: ["foundation models", "autonomous laboratories"],
+          modifierTerms: ["review", "survey", "趋势"]
+        },
+        sourcePreferences: {
+          dateRange: { from: 2020, to: 2026 },
+          institutions: ["DeepMind"],
+          preferredSources: ["Nature", "fake-brief-pref"],
+          domains: ["foundation models"]
+        },
+        evidencePreferences: {
+          requireDoi: true,
+          requireAbstract: true,
+          minQuality: "Tier 2",
+          studyTypes: ["review", "benchmark"]
+        },
+        outputPreferences: { language: "zh", include: ["preference impact"] }
+      }
+    });
+    assert.equal(result.status, "completed");
+    const artifacts = await Promise.all(result.artifactIds.map(async (id) => ({ id, text: (await runtime.services.artifactStore.read(id)).toString("utf8") })));
+    const jsonByStage = (stage) => artifacts.map((artifact) => {
+      try { return JSON.parse(artifact.text); } catch { return null; }
+    }).find((parsed) => parsed?.stage === stage);
+    const brief = jsonByStage("research_brief");
+    const scores = jsonByStage("preference_scores");
+    const screening = jsonByStage("screening_log");
+    const included = jsonByStage("included_studies");
+    assert.equal(brief.compiledMetadata.sourcePreferences.dateRange.from, 2020);
+    assert.equal(scores.summary.recordsScored, 3);
+    assert.equal(screening.decisions.find((d) => d.paperId === "brief-good").decision, "include");
+    assert.equal(screening.decisions.find((d) => d.paperId === "brief-old").hardExcluded, true);
+    assert.equal(screening.decisions.find((d) => d.paperId === "brief-no-doi").hardExcluded, true);
+    assert.deepEqual(included.papers.map((paper) => paper.id), ["brief-good"]);
+    const final = artifacts.find((artifact) => artifact.text.includes("# PRISMA-Style Literature Review") && artifact.text.includes("preference_scores.json"));
+    assert.ok(final);
+    assert.match(final.text, /User Preferences/);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("stage contract retries a failed stage with verifier feedback", async () => {
   const { runtime, cleanup } = await tempRuntime();
   try {
