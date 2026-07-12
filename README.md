@@ -82,6 +82,7 @@ jiuwen-sci/
   - `/status`
   - `/model`
   - `/packs`
+  - `/brief show|load|save|clear|new|draft`
   - `/sessions [n]`
   - `/session [id]`
   - `/tree [id]`
@@ -90,6 +91,7 @@ jiuwen-sci/
   - `/review [id]`
   - `/exit`
 - 支持 `exec`、`resume`、`doctor`、`session`、`artifact`、`review`、`pack`、`literature review` 等非交互命令。
+- 支持用户可读的 Research Brief，通过 `--brief <file>` 或 REPL `/brief` 命令增强当前 topic。
 - CLI 会在需要时自动用 `--experimental-sqlite` 重启自身，用户不需要手动记住 Node 参数。
 
 ### Core Runtime
@@ -224,6 +226,54 @@ jiuwen-sci/
   - literature pack 不硬编码 AI4S 领域词
   - 领域词应来自用户问题、protocol artifact、主控 Agent 或 `metadata.topicProfile`
 
+### Research Brief
+
+Research Brief 是面向用户的可读 topic 增强配置。用户不需要直接理解 runtime metadata，可以用 JSON 或简化 YAML 描述调研范围、关注问题、数据库偏好、机构偏好、证据类型和输出要求。CLI 会把它编译成 runtime metadata，例如 `topicProfile`、`dbs`、`limit`、`sourcePreferences`、`evidencePreferences` 和 `outputPreferences`。
+
+示例：
+
+```yaml
+topic: AI4S的发展现状和趋势
+intent: literature_review
+scope:
+  include:
+    - AI4S
+    - AI for Science
+    - scientific discovery
+  exclude:
+    - news articles
+focus:
+  questions:
+    - AI4S 当前发展阶段是什么？
+    - 未来 3-5 年趋势是什么？
+  domains:
+    - materials discovery
+    - drug discovery
+  institutions:
+    - DeepMind
+    - 清华
+sources:
+  databases:
+    - openalex
+    - arxiv
+    - semantic-scholar
+    - crossref
+  date_range:
+    from: 2020
+    to: 2026
+evidence:
+  study_types:
+    - review
+    - survey
+    - benchmark
+  require_abstract: true
+output:
+  language: zh
+  format: report
+  depth: deep
+  max_papers: 30
+```
+
 ## 安装
 
 环境要求：
@@ -299,6 +349,8 @@ jiuwen-sci> 请调研 AI4S 的发展现状和趋势
 
 ```text
 jiuwen-sci> /sessions 5
+jiuwen-sci> /brief draft AI4S 2020 2026 DeepMind 清华 发展趋势
+jiuwen-sci> /brief show
 jiuwen-sci> /tree
 jiuwen-sci> /artifacts last
 jiuwen-sci> /artifact <artifact-id>
@@ -319,6 +371,7 @@ jiuwen-sci --model volcengine:glm-5.2 \
 ```bash
 jiuwen-sci --model volcengine:glm-5.2 \
   literature review "AI4S 的发展现状和趋势" \
+  --brief ai4s.yaml \
   --db openalex,arxiv,semantic-scholar,crossref,pubmed,europepmc \
   --limit 20 \
   --max-review-rounds 2

@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import type { RuntimeEvent, RuntimeRunResult } from "@jiuwen-sci/core";
 import { spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -13,6 +13,7 @@ ensureExperimentalSqlite();
 type GlobalOptions = {
   cd?: string;
   model?: string;
+  brief?: string;
   config?: string[];
   approval?: string;
   sandbox?: string;
@@ -20,6 +21,21 @@ type GlobalOptions = {
   json?: boolean;
   verbose?: boolean;
   quiet?: boolean;
+};
+
+type ResearchBrief = {
+  topic?: string;
+  intent?: string;
+  scope?: { include?: string[]; exclude?: string[] };
+  focus?: { questions?: string[]; domains?: string[]; institutions?: string[]; geographies?: string[] };
+  sources?: { databases?: string[]; preferred_sources?: string[]; exclude_sources?: string[]; date_range?: { from?: string | number; to?: string | number } };
+  evidence?: { study_types?: string[]; min_quality?: string; require_doi?: boolean; require_abstract?: boolean };
+  output?: { language?: string; format?: string; depth?: string; max_papers?: number; include?: string[] };
+  notes?: string[];
+};
+
+type InteractiveState = {
+  brief?: ResearchBrief;
 };
 
 const program = new Command();
@@ -30,6 +46,7 @@ program
   .version("0.1.0")
   .option("-C, --cd <path>", "set working directory")
   .option("-m, --model <provider:model>", "model to use")
+  .option("--brief <file>", "load a readable research brief JSON/YAML file")
   .option("-c, --config <key=value...>", "override config")
   .option("-a, --approval <mode>", "approval mode: on-request | never | always")
   .option("--sandbox <mode>", "sandbox mode: none | readonly | workspace-write")
@@ -63,6 +80,7 @@ program.command("exec")
   .option("--strategy <strategy>", "execution strategy", "auto")
   .option("--max-retries <n>", "maximum retries")
   .option("--max-review-rounds <n>", "maximum review rounds")
+  .option("--brief <file>", "load a readable research brief JSON/YAML file")
   .action(async (prompt: string, options: any) => runExec(prompt, options));
 
 program.command("resume")
@@ -164,15 +182,23 @@ literature.command("review")
   .description("run a literature review workflow")
   .argument("<question>", "research question")
   .option("--db <ids>", "comma separated db ids")
-  .option("--limit <n>", "result limit", "25")
+  .option("--limit <n>", "result limit")
   .option("--strategy <strategy>", "execution strategy", "workflow_controlled")
-  .option("--max-review-rounds <n>", "maximum review rounds", "2")
+  .option("--max-review-rounds <n>", "maximum review rounds")
+  .option("--brief <file>", "load a readable research brief JSON/YAML file")
   .action(async (question: string, options: any) => {
     const opts = program.opts<GlobalOptions>();
     const { parseModelRef } = await loadCore();
     const runtime = await makeRuntime(opts, eventSink(opts));
     await runtime.start();
     try {
+      const brief = await loadBriefOption(options.brief ?? opts.brief, opts);
+      const metadata = compileBriefMetadata(brief, question, {
+        workflow: "literature-review",
+        dbs: options.db ? String(options.db).split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+        limit: options.limit ? Number(options.limit) : undefined,
+        maxReviewRounds: options.maxReviewRounds ? Number(options.maxReviewRounds) : undefined
+      });
       const result = await runtime.run({
         input: question,
         agentId: "research-orchestrator",
@@ -180,12 +206,7 @@ literature.command("review")
         cwd: opts.cd ?? process.cwd(),
         model: parseModelRef(opts.model),
         packIds: ["literature"],
-        metadata: {
-          workflow: "literature-review",
-          dbs: options.db ? String(options.db).split(",").map((s) => s.trim()).filter(Boolean) : ["openalex"],
-          limit: Number(options.limit),
-          maxReviewRounds: Number(options.maxReviewRounds)
-        }
+        metadata
       });
       printRunResult(result, opts);
     } finally {
@@ -199,15 +220,16 @@ async function runExec(prompt: string, options: any): Promise<void> {
   const runtime = await makeRuntime(opts, eventSink(opts));
   await runtime.start();
   try {
+    const brief = await loadBriefOption(options.brief ?? opts.brief, opts);
     const result = await runtime.run({
       input: prompt,
       strategy: options.strategy ?? opts.strategy ?? "auto",
       model: parseModelRef(opts.model),
       cwd: opts.cd ?? process.cwd(),
-      metadata: {
+      metadata: compileBriefMetadata(brief, prompt, {
         maxRetries: Number(options.maxRetries ?? 0) || undefined,
         maxReviewRounds: Number(options.maxReviewRounds ?? 0) || undefined
-      }
+      })
     });
     printRunResult(result, opts);
   } finally {
@@ -222,8 +244,12 @@ async function runInteractive(): Promise<void> {
   await runtime.start();
   const rl = createInterface({ input, output, prompt: "jiuwen-sci> " });
   let lastSessionId: string | undefined;
+  const state: InteractiveState = {
+    brief: await loadBriefOption(opts.brief, opts)
+  };
   try {
     if (!opts.quiet) printInteractiveHelp();
+    if (state.brief && !opts.quiet) console.log(`Loaded brief: ${state.brief.topic ?? "untitled"}`);
     rl.prompt();
     for await (const raw of rl) {
       const line = raw.trim();
@@ -233,14 +259,15 @@ async function runInteractive(): Promise<void> {
       }
       try {
         if (line.startsWith("/")) {
-          const shouldExit = await handleSlashCommand(line, runtime, opts, () => lastSessionId);
+          const shouldExit = await handleSlashCommand(line, runtime, opts, () => lastSessionId, state);
           if (shouldExit) break;
         } else {
           const result = await runtime.run({
             input: line,
             strategy: opts.strategy ?? "auto",
             model: parseModelRef(opts.model),
-            cwd: opts.cd ?? process.cwd()
+            cwd: opts.cd ?? process.cwd(),
+            metadata: compileBriefMetadata(state.brief, line)
           });
           lastSessionId = result.sessionId;
           printRunResult(result, opts);
@@ -319,7 +346,7 @@ async function loadCore() {
   return import("@jiuwen-sci/core");
 }
 
-async function handleSlashCommand(line: string, runtime: Awaited<ReturnType<typeof makeRuntime>>, opts: GlobalOptions, lastSessionId: () => string | undefined): Promise<boolean> {
+async function handleSlashCommand(line: string, runtime: Awaited<ReturnType<typeof makeRuntime>>, opts: GlobalOptions, lastSessionId: () => string | undefined, state: InteractiveState): Promise<boolean> {
   const [command = "", ...args] = line.slice(1).split(/\s+/).filter(Boolean);
   switch (command) {
     case "exit":
@@ -333,6 +360,9 @@ async function handleSlashCommand(line: string, runtime: Awaited<ReturnType<type
       return false;
     case "packs":
       print(runtime.services.packRegistry.list().map((p: any) => ({ id: p.id, name: p.name, version: p.version })), opts);
+      return false;
+    case "brief":
+      await handleBriefCommand(args, state, opts);
       return false;
     case "status": {
       const id = lastSessionId();
@@ -402,10 +432,253 @@ async function sessionTree(runtime: Awaited<ReturnType<typeof makeRuntime>>, roo
   return lines.join("\n");
 }
 
+async function handleBriefCommand(args: string[], state: InteractiveState, opts: GlobalOptions): Promise<void> {
+  const action = args[0] ?? "show";
+  if (action === "show") {
+    if (!state.brief) console.log("No research brief loaded.");
+    else console.log(formatBrief(state.brief));
+    return;
+  }
+  if (action === "load") {
+    const file = args[1];
+    if (!file) {
+      console.log("Usage: /brief load <file>");
+      return;
+    }
+    state.brief = await readResearchBrief(resolveUserPath(file, opts));
+    console.log(`Loaded brief: ${state.brief.topic ?? "untitled"}`);
+    return;
+  }
+  if (action === "clear") {
+    state.brief = undefined;
+    console.log("Cleared research brief.");
+    return;
+  }
+  if (action === "save") {
+    const file = args[1];
+    if (!file) {
+      console.log("Usage: /brief save <file>");
+      return;
+    }
+    if (!state.brief) {
+      console.log("No research brief loaded.");
+      return;
+    }
+    await writeFile(resolveUserPath(file, opts), formatBrief(state.brief));
+    console.log(`Saved brief: ${file}`);
+    return;
+  }
+  if (action === "new" || action === "draft") {
+    const text = args.slice(1).join(" ").trim();
+    if (!text) {
+      console.log(`Usage: /brief ${action} <topic or requirements>`);
+      return;
+    }
+    state.brief = draftResearchBrief(text);
+    console.log(formatBrief(state.brief));
+    return;
+  }
+  console.log("Usage: /brief [show|load <file>|save <file>|clear|new <topic>|draft <requirements>]");
+}
+
+async function loadBriefOption(file: string | undefined, opts: GlobalOptions): Promise<ResearchBrief | undefined> {
+  if (!file) return undefined;
+  return readResearchBrief(resolveUserPath(file, opts));
+}
+
+async function readResearchBrief(file: string): Promise<ResearchBrief> {
+  const text = await readFile(file, "utf8");
+  const trimmed = text.trim();
+  const parsed = trimmed.startsWith("{") ? JSON.parse(trimmed) : parseBriefYaml(trimmed);
+  return normalizeBrief(parsed);
+}
+
+function compileBriefMetadata(brief: ResearchBrief | undefined, prompt: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const metadata: Record<string, unknown> = { ...overrides };
+  if (!brief) {
+    if (!metadata.dbs && metadata.workflow === "literature-review") metadata.dbs = ["openalex"];
+    if (!metadata.limit && metadata.workflow === "literature-review") metadata.limit = 25;
+    if (!metadata.maxReviewRounds && metadata.workflow === "literature-review") metadata.maxReviewRounds = 2;
+    return compactMetadata(metadata);
+  }
+  const topic = brief.topic ?? prompt;
+  const include = brief.scope?.include ?? [];
+  const domains = brief.focus?.domains ?? [];
+  const questions = brief.focus?.questions ?? [];
+  const institutions = brief.focus?.institutions ?? [];
+  const geographies = brief.focus?.geographies ?? [];
+  metadata.researchBrief = brief;
+  metadata.topicProfile = {
+    topicLabel: topic,
+    coreTerms: uniqueStrings([topic, ...include, ...questions]),
+    domainTerms: uniqueStrings([...domains, ...institutions, ...geographies]),
+    modifierTerms: uniqueStrings(["development status", "current status", "trend", "trends", "future directions", "review", "survey", "现状", "趋势", "发展"])
+  };
+  metadata.sourcePreferences = {
+    preferredSources: brief.sources?.preferred_sources ?? [],
+    excludedSources: brief.sources?.exclude_sources ?? [],
+    dateRange: brief.sources?.date_range,
+    institutions,
+    geographies
+  };
+  metadata.evidencePreferences = brief.evidence ?? {};
+  metadata.outputPreferences = brief.output ?? {};
+  metadata.inclusionCriteria = brief.scope?.include ?? [];
+  metadata.exclusionCriteria = brief.scope?.exclude ?? [];
+  if (!metadata.dbs && brief.sources?.databases?.length) metadata.dbs = brief.sources.databases;
+  if (!metadata.limit && brief.output?.max_papers) metadata.limit = brief.output.max_papers;
+  if (!metadata.workflow && (brief.intent === "literature_review" || /literature|review|survey|文献|调研|综述/.test(`${brief.intent ?? ""} ${prompt}`.toLowerCase()))) metadata.workflow = "literature-review";
+  if (!metadata.dbs && metadata.workflow === "literature-review") metadata.dbs = ["openalex"];
+  if (!metadata.limit && metadata.workflow === "literature-review") metadata.limit = 25;
+  if (!metadata.maxReviewRounds && metadata.workflow === "literature-review") metadata.maxReviewRounds = 2;
+  return compactMetadata(metadata);
+}
+
+function draftResearchBrief(text: string): ResearchBrief {
+  return {
+    topic: text,
+    intent: "literature_review",
+    scope: { include: extractBriefTerms(text), exclude: [] },
+    focus: { questions: [text], domains: [], institutions: extractInstitutions(text), geographies: [] },
+    sources: { databases: ["openalex", "arxiv", "semantic-scholar", "crossref"], preferred_sources: [], exclude_sources: [], date_range: extractDateRange(text) },
+    evidence: { study_types: ["review", "survey", "benchmark", "empirical study"], require_abstract: true },
+    output: { language: /[一-龥]/.test(text) ? "zh" : "en", format: "report", depth: "standard", max_papers: 25, include: ["PRISMA flow", "evidence table", "citation list", "gaps and trends"] },
+    notes: []
+  };
+}
+
+function normalizeBrief(value: any): ResearchBrief {
+  return {
+    topic: stringValue(value.topic),
+    intent: stringValue(value.intent),
+    scope: value.scope ? { include: stringArray(value.scope.include), exclude: stringArray(value.scope.exclude) } : undefined,
+    focus: value.focus ? { questions: stringArray(value.focus.questions), domains: stringArray(value.focus.domains), institutions: stringArray(value.focus.institutions), geographies: stringArray(value.focus.geographies) } : undefined,
+    sources: value.sources ? { databases: stringArray(value.sources.databases), preferred_sources: stringArray(value.sources.preferred_sources), exclude_sources: stringArray(value.sources.exclude_sources), date_range: value.sources.date_range } : undefined,
+    evidence: value.evidence,
+    output: value.output ? { ...value.output, max_papers: numberValue(value.output.max_papers) } : undefined,
+    notes: stringArray(value.notes)
+  };
+}
+
+function parseBriefYaml(text: string): any {
+  const root: any = {};
+  const stack: { indent: number; value: any }[] = [{ indent: -1, value: root }];
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (!rawLine.trim() || rawLine.trim().startsWith("#")) continue;
+    const indent = rawLine.match(/^ */)?.[0].length ?? 0;
+    const line = rawLine.trim();
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].value;
+    if (line.startsWith("- ")) {
+      if (!Array.isArray(parent)) continue;
+      parent.push(parseScalar(line.slice(2)));
+      continue;
+    }
+    const idx = line.indexOf(":");
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const rest = line.slice(idx + 1).trim();
+    if (rest) {
+      parent[key] = parseScalar(rest);
+      continue;
+    }
+    const nextContainer = nextMeaningfulLineIsArray(text, rawLine) ? [] : {};
+    parent[key] = nextContainer;
+    stack.push({ indent, value: nextContainer });
+  }
+  return root;
+}
+
+function nextMeaningfulLineIsArray(text: string, currentLine: string): boolean {
+  const lines = text.split(/\r?\n/);
+  const index = lines.indexOf(currentLine);
+  const currentIndent = currentLine.match(/^ */)?.[0].length ?? 0;
+  for (const line of lines.slice(index + 1)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const indent = line.match(/^ */)?.[0].length ?? 0;
+    return indent > currentIndent && line.trim().startsWith("- ");
+  }
+  return false;
+}
+
+function parseScalar(value: string): unknown {
+  const unquoted = value.replace(/^["']|["']$/g, "");
+  if (unquoted === "true") return true;
+  if (unquoted === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(unquoted)) return Number(unquoted);
+  return unquoted;
+}
+
+function formatBrief(brief: ResearchBrief): string {
+  return yamlStringify(normalizeBrief(brief)).trimEnd() + "\n";
+}
+
+function yamlStringify(value: any, indent = 0): string {
+  const pad = " ".repeat(indent);
+  if (Array.isArray(value)) return value.map((item) => `${pad}- ${formatScalar(item)}\n`).join("");
+  if (!value || typeof value !== "object") return `${pad}${formatScalar(value)}\n`;
+  return Object.entries(value)
+    .filter(([, child]) => child !== undefined && !(Array.isArray(child) && child.length === 0))
+    .map(([key, child]) => {
+      if (Array.isArray(child)) return `${pad}${key}:\n${yamlStringify(child, indent + 2)}`;
+      if (child && typeof child === "object") return `${pad}${key}:\n${yamlStringify(child, indent + 2)}`;
+      return `${pad}${key}: ${formatScalar(child)}\n`;
+    })
+    .join("");
+}
+
+function formatScalar(value: unknown): string {
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  return String(value ?? "").replace(/\n/g, " ");
+}
+
+function resolveUserPath(file: string, opts: GlobalOptions): string {
+  return path.resolve(opts.cd ?? process.cwd(), file);
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(String).map((item) => item.trim()).filter(Boolean);
+}
+
+function numberValue(value: unknown): number | undefined {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : undefined;
+}
+
+function uniqueStrings(values: unknown[]): string[] {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function compactMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
+}
+
+function extractBriefTerms(text: string): string[] {
+  const quoted = [...text.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  const acronyms = [...text.matchAll(/\b[A-Z][A-Z0-9]{2,}\b/g)].map((match) => match[0]);
+  return uniqueStrings([...quoted, ...acronyms, text]).slice(0, 6);
+}
+
+function extractInstitutions(text: string): string[] {
+  const known = ["DeepMind", "OpenAI", "Stanford", "MIT", "Harvard", "清华", "北大", "中科院", "浙大", "上海交大"];
+  return known.filter((name) => text.includes(name));
+}
+
+function extractDateRange(text: string): { from?: number; to?: number } | undefined {
+  const years = [...text.matchAll(/\b(19|20)\d{2}\b/g)].map((match) => Number(match[0]));
+  if (!years.length) return undefined;
+  return { from: Math.min(...years), to: Math.max(...years) };
+}
+
 function printInteractiveHelp(): void {
   console.log("jiuwen-sci interactive mode");
   console.log("Type a research goal and press Enter. The orchestrator will select registered packs when useful.");
-  console.log("Commands: /help /status /model /packs /sessions [n] /session [id] /tree [id] /artifacts [id|last] /artifact <id> /review [id] /exit");
+  console.log("Commands: /help /status /model /packs /brief /sessions [n] /session [id] /tree [id] /artifacts [id|last] /artifact <id> /review [id] /exit");
 }
 
 program.parseAsync(process.argv).catch((error) => {
