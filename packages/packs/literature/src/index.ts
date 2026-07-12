@@ -603,16 +603,21 @@ export const scienceSearchTool: ToolDefinition<any, any> = {
   permission: { kind: "network", default: "allow" },
   async execute(ctx, input) {
     const registry = getLiteratureConnectorRegistry(ctx.runtime);
-    const connector = registry.get(String(input.db));
-    if (!connector) throw new RuntimeError("LITERATURE_DB_NOT_FOUND", String(input.db));
+    const db = normalizeLiteratureDatabaseIds(input.db, registry)[0] ?? String(input.db);
+    const connector = registry.get(db);
+    if (!connector) {
+      const structuredError = sourceError(String(input.db), "search", new SourceRequestError("unsupported", false, `Connector ${String(input.db)} is not registered.`));
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db: input.db, query: input.query, error: structuredError }, null, 2) });
+      return { ...structuredError, query: input.query, count: 0, results: [], artifactId: artifact.id };
+    }
     try {
       const results = await connector.search({ query: String(input.query), limit: Number(input.limit ?? 25) });
-      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_results", db: input.db, query: input.query, results }, null, 2) });
-      await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: `Search results from ${input.db}` }], edges: [] });
-      return { ok: true, db: input.db, query: input.query, count: results.length, results, artifactId: artifact.id };
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_results", db, query: input.query, requestedDb: input.db, results }, null, 2) });
+      await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: `Search results from ${db}` }], edges: [] });
+      return { ok: true, db, query: input.query, count: results.length, results, artifactId: artifact.id };
     } catch (error) {
-      const structuredError = sourceError(String(input.db), "search", error);
-      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db: input.db, query: input.query, error: structuredError }, null, 2) });
+      const structuredError = sourceError(db, "search", error);
+      const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db, query: input.query, requestedDb: input.db, error: structuredError }, null, 2) });
       return { ...structuredError, query: input.query, count: 0, results: [], artifactId: artifact.id };
     }
   }
@@ -845,15 +850,19 @@ export const literatureReviewStageContract: StageContractDefinition = {
       },
       next: [{ when: "passed", stageId: "search_dedupe" }],
       run: async (ctx) => {
+        const registry = getLiteratureConnectorRegistry(ctx.services);
+        const metadataDbs = normalizeLiteratureDatabaseIds(ctx.metadata.dbs, registry);
         const agentProtocol = await readStageArtifact(ctx.services, ctx.artifactIds, "protocol");
         const agentQueries = await readStageArtifact(ctx.services, ctx.artifactIds, "queries");
         if (agentProtocol && agentQueries) {
-          const dbs = Array.isArray(agentProtocol.databases) && agentProtocol.databases.length ? agentProtocol.databases.map(String) : selectedQueryDbs(agentQueries);
+          const agentDbs = normalizeLiteratureDatabaseIds(agentProtocol.databases, registry);
+          const queryDbs = normalizeLiteratureDatabaseIds(selectedQueryDbs(agentQueries), registry);
+          const dbs = metadataDbs.length ? metadataDbs : agentDbs.length ? agentDbs : queryDbs.length ? queryDbs : ["openalex"];
           const topicProfile = topicProfileFromQueries(agentQueries);
           return { statePatch: { limit: Number(agentProtocol.limit ?? ctx.metadata.limit ?? 25), dbs, criteria: agentProtocol.criteria ?? agentQueries.criteria ?? defaultCriteria(), queryPlan: agentQueries, topicProfile } };
         }
         const limit = Number(ctx.metadata.limit ?? 25);
-        const dbs = Array.isArray(ctx.metadata.dbs) && ctx.metadata.dbs.length ? ctx.metadata.dbs.map(String) : ["openalex", "semantic-scholar", "crossref"];
+        const dbs = metadataDbs.length ? metadataDbs : ["openalex", "semantic-scholar", "crossref"];
         const criteria = defaultCriteria();
         const queryPlan = buildQueryPlan(ctx.input, dbs, criteria);
         const protocol = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "protocol", question: ctx.input, databases: dbs, limit, criteria, conceptDefinition: queryPlan.conceptDefinition, workflow: ctx.contract.stages.map((s) => s.id) }, null, 2) });
@@ -886,15 +895,21 @@ export const literatureReviewStageContract: StageContractDefinition = {
           const deduped = (agentDedupe.deduped ?? agentDedupe.papers ?? []) as PaperHit[];
           return { statePatch: { allPapers: deduped, searchCounts: agentIdentification.searchCounts ?? {}, sourceErrors: agentIdentification.sourceErrors ?? [], deduped, duplicates: agentDedupe.duplicates ?? [], recordsIdentifiedThroughCitationChaining: Number(agentIdentification.recordsIdentifiedThroughCitationChaining ?? 0), citationChainHintsFound: Number(agentIdentification.citationChainHintsFound ?? 0) } };
         }
-        const dbs = (ctx.state.dbs as string[]) ?? ["openalex"];
+        const registry = getLiteratureConnectorRegistry(ctx.services);
+        const metadataDbs = normalizeLiteratureDatabaseIds(ctx.metadata.dbs, registry);
+        const dbs = normalizeLiteratureDatabaseIds(ctx.state.dbs, registry, metadataDbs.length ? metadataDbs : ["openalex"]);
         const limit = Number(ctx.state.limit ?? 25);
         const allPapers: PaperHit[] = [];
         const searchArtifactIds: string[] = [];
         const searchCounts: Record<string, number> = {};
         const sourceErrors: any[] = [];
+        const queryPlan = ctx.state.queryPlan as any;
+        const selectedQueries = normalizeSelectedQueries(queryPlan).map((query) => ({
+          ...query,
+          database: normalizeLiteratureDatabaseIds(query.database, registry)[0] ?? query.database
+        }));
         for (const db of dbs) {
-          const queryPlan = ctx.state.queryPlan as any;
-          const query = queryPlan?.selectedQueries?.find((q: any) => q.database === db)?.query ?? ctx.input;
+          const query = selectedQueries.find((q: any) => q.database === db)?.query ?? ctx.input;
           const result = await ctx.tool({ toolId: "science_search", input: { db, query, limit } });
           const out = result.output as any;
           allPapers.push(...(out.results ?? []));
@@ -1242,6 +1257,58 @@ function normalizeDatabases(value: any): string[] {
   const databases = value?.databases ?? value?.databasePlan ?? value?.database_plan ?? [];
   if (!Array.isArray(databases)) return [];
   return databases.map((db: any) => typeof db === "string" ? db : (db?.id ?? db?.name ?? db?.database)).filter(Boolean).map(String);
+}
+
+const databaseAliases: Record<string, string> = {
+  openalex: "openalex",
+  "open alex": "openalex",
+  arxiv: "arxiv",
+  "semantic scholar": "semantic-scholar",
+  semanticscholar: "semantic-scholar",
+  "semantic-scholar": "semantic-scholar",
+  crossref: "crossref",
+  pubmed: "pubmed",
+  "pub med": "pubmed",
+  europepmc: "europepmc",
+  "europe pmc": "europepmc",
+  biorxiv: "biorxiv",
+  "bio rxiv": "biorxiv",
+  medrxiv: "medrxiv",
+  "med rxiv": "medrxiv"
+};
+
+export function normalizeLiteratureDatabaseIds(value: any, registry?: LiteratureConnectorRegistry, fallback: string[] = []): string[] {
+  const available = registry ? new Set(registry.list().map((connector) => connector.id)) : new Set<string>();
+  const aliases = new Map<string, string>();
+  for (const [alias, id] of Object.entries(databaseAliases)) aliases.set(databaseKey(alias), id);
+  for (const connector of registry?.list() ?? []) {
+    aliases.set(databaseKey(connector.id), connector.id);
+    aliases.set(databaseKey(connector.name), connector.id);
+  }
+
+  const normalized: string[] = [];
+  for (const candidate of databaseCandidates(value)) {
+    const direct = String(candidate).trim();
+    if (!direct) continue;
+    const id = aliases.get(databaseKey(direct)) ?? direct;
+    if (available.size && !available.has(id)) continue;
+    if (!normalized.includes(id)) normalized.push(id);
+  }
+  return normalized.length ? normalized : fallback;
+}
+
+function databaseCandidates(value: any): string[] {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => databaseCandidates(item));
+  if (typeof value === "string") return [value];
+  if (typeof value === "object") {
+    return [value.id, value.name, value.database, value.db, value.source].filter((item) => typeof item === "string");
+  }
+  return [String(value)];
+}
+
+function databaseKey(value: string): string {
+  return value.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function normalizeSelectedQueries(value: any): { database?: string; query?: string; rationale?: string }[] {

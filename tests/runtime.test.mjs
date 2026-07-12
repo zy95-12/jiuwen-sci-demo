@@ -11,7 +11,7 @@ import {
   StageContractRunner,
   ToolRuntime
 } from "@jiuwen-sci/core";
-import { getLiteratureConnectorRegistry, literaturePack } from "@jiuwen-sci/literature-pack";
+import { getLiteratureConnectorRegistry, literaturePack, normalizeLiteratureDatabaseIds } from "@jiuwen-sci/literature-pack";
 
 async function tempRuntime() {
   const cwd = await mkdtemp(path.join(tmpdir(), "jiuwen-sci-test-"));
@@ -305,6 +305,32 @@ test("literature protocol verifier prefers latest artifacts and accepts common f
     const conceptVerifier = runtime.services.verifierRegistry.get("literature_query_concepts_valid");
     assert.equal((await protocolVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
     assert.equal((await conceptVerifier.verify({ sessionId: session.id, services: runtime.services, contract, stage, artifactIds, state: {} })).ok, true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("literature database normalization keeps only executable connector ids", async () => {
+  const { runtime, cleanup } = await tempRuntime();
+  try {
+    runtime.registerPack(literaturePack);
+    const registry = getLiteratureConnectorRegistry(runtime.services);
+    registry.register({
+      id: "fake-executable",
+      name: "Fake Executable",
+      description: "Fake connector for db normalization",
+      async search() {
+        return [];
+      }
+    });
+    const dbs = normalizeLiteratureDatabaseIds([
+      { name: "OpenAlex" },
+      { database: "Semantic Scholar" },
+      { name: "Web of Science" },
+      "fake-executable",
+      { db: "Scopus" }
+    ], registry);
+    assert.deepEqual(dbs, ["openalex", "semantic-scholar", "fake-executable"]);
   } finally {
     await cleanup();
   }
