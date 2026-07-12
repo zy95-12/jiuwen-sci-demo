@@ -36,7 +36,7 @@ export class StageContractRunner {
     for (let step = 0; currentId && step < maxStages; step++) {
       const stage = stageById.get(currentId);
       if (!stage) throw new RuntimeError("STAGE_NOT_FOUND", currentId);
-      await this.services.eventBus.emit({ type: "stage.started", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id });
+      await this.services.eventBus.emit({ type: "stage.started", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, stageGoal: stage.goal, agentId: stage.agentId });
       const attempts = Math.max(1, stage.retryPolicy?.maxAttempts ?? 1);
       const stageInputArtifactIds = activeArtifactIds;
       let passed = false;
@@ -59,12 +59,12 @@ export class StageContractRunner {
           passed = true;
           activeArtifactIds = [...new Set([...gateArtifactIds, gate.reportArtifactId])];
           if (gate.action === "go_to_stage") lastResult.nextStageId = gate.nextStageId;
-          await this.services.eventBus.emit({ type: gate.action === "go_to_stage" ? "stage.redirected" : "stage.completed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, attempt, nextStageId: gate.nextStageId });
+          await this.services.eventBus.emit({ type: gate.action === "go_to_stage" ? "stage.redirected" : "stage.completed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, stageGoal: stage.goal, agentId: stage.agentId, attempt, nextStageId: gate.nextStageId });
           break;
         }
         if (gate.action === "partial" || gate.action === "fail") terminalAction = gate.action;
 
-        await this.services.eventBus.emit({ type: "stage.failed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, attempt, messages: gate.messages, action: gate.action });
+        await this.services.eventBus.emit({ type: "stage.failed", sessionId: input.sessionId, contractId: contract.id, stageId: stage.id, stageGoal: stage.goal, agentId: stage.agentId, attempt, messages: gate.messages, action: gate.action });
         state[`stage.${stage.id}.feedback`] = gate.messages;
         if (gate.action !== "retry_stage") break;
       }

@@ -3,7 +3,7 @@ import { Command } from "commander";
 import type { RuntimeEvent, RuntimeRunResult } from "@jiuwen-sci/core";
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -303,16 +303,70 @@ async function withStartedRuntime(fn: (runtime: Awaited<ReturnType<typeof makeRu
 }
 
 function eventSink(opts: GlobalOptions): (event: RuntimeEvent) => void {
+  const logPath = path.join(path.resolve(opts.cd ?? process.cwd()), ".jiuwen-sci", "logs", "events.jsonl");
+  mkdirSync(path.dirname(logPath), { recursive: true });
   return (event) => {
+    appendFileSync(logPath, `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
     if (opts.quiet) return;
     if (opts.json) {
       console.log(JSON.stringify(event));
       return;
     }
-    if (opts.verbose || ["session.created", "strategy.selected", "tool.completed", "task.started", "task.completed"].includes(event.type)) {
-      console.log(`- ${event.type}${event.sessionId ? ` ${event.sessionId}` : ""}${event.toolId ? ` ${event.toolId}` : ""}${event.strategy ? ` ${event.strategy}` : ""}`);
-    }
+    const line = formatEventLine(event, opts.verbose === true);
+    if (line) console.log(line);
   };
+}
+
+function formatEventLine(event: RuntimeEvent, verbose: boolean): string | null {
+  const session = String(event.sessionId ?? event.parentSessionId ?? "");
+  const sessionSuffix = session ? ` [${session}]` : "";
+  switch (event.type) {
+    case "session.created":
+      return `- Session started${sessionSuffix}`;
+    case "pack.workflow.selected":
+      return `- Workflow selected: ${event.workflowId}${event.packId ? ` (pack ${event.packId})` : ""}${event.reason ? ` - ${event.reason}` : ""}`;
+    case "strategy.selected":
+      return `- Strategy selected: ${event.strategy}${sessionSuffix}`;
+    case "stage.started":
+      return `- Stage started: ${event.stageId}${event.agentId ? ` via ${event.agentId}` : ""}${sessionSuffix}`;
+    case "stage.completed":
+      return `- Stage completed: ${event.stageId}${event.attempt ? ` attempt ${event.attempt}` : ""}${sessionSuffix}`;
+    case "stage.redirected":
+      return `- Stage redirected: ${event.stageId} -> ${event.nextStageId}${sessionSuffix}`;
+    case "stage.failed":
+      return `- Stage failed: ${event.stageId}${event.attempt ? ` attempt ${event.attempt}` : ""}${event.action ? ` (${event.action})` : ""}${sessionSuffix}`;
+    case "task.started":
+      return `- Subagent started: ${event.agentId}${event.childSessionId ? ` (${event.childSessionId})` : ""}${event.parentSessionId ? ` [parent ${event.parentSessionId}]` : ""}`;
+    case "task.completed":
+      return `- Subagent completed${event.childSessionId ? `: ${event.childSessionId}` : ""}${event.parentSessionId ? ` [parent ${event.parentSessionId}]` : ""}`;
+    case "task.failed":
+      return `- Subagent failed: ${event.agentId}${event.childSessionId ? ` (${event.childSessionId})` : ""}${event.error ? ` - ${event.error}` : ""}`;
+    case "literature.search.started":
+      return `- Search started: ${event.db} query=${formatInline(event.query)}${event.limit ? ` limit=${event.limit}` : ""}${sessionSuffix}`;
+    case "literature.search.completed":
+      return `- Search completed: ${event.db} ${event.count ?? 0} results${formatPaperTitles(event.papers)}${sessionSuffix}`;
+    case "literature.search.failed":
+      return `- Search failed: ${event.db} query=${formatInline(event.query)}${event.error ? ` - ${event.error}` : ""}${sessionSuffix}`;
+    case "tool.started":
+      return verbose ? `- Tool started: ${event.toolId}${event.agentId ? ` by ${event.agentId}` : ""}${sessionSuffix}` : null;
+    case "tool.completed":
+      return verbose ? `- Tool completed: ${event.toolId}${event.agentId ? ` by ${event.agentId}` : ""}${sessionSuffix}` : null;
+    default:
+      if (!verbose) return null;
+      return `- ${event.type}${sessionSuffix}`;
+  }
+}
+
+function formatInline(value: unknown): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return JSON.stringify(text.length > 180 ? `${text.slice(0, 180)}...` : text);
+}
+
+function formatPaperTitles(value: unknown): string {
+  if (!Array.isArray(value) || !value.length) return "";
+  const titles = value.map((paper: any) => paper?.title).filter(Boolean).slice(0, 3);
+  if (!titles.length) return "";
+  return `; top: ${titles.map((title) => String(title).replace(/\s+/g, " ").trim()).join(" | ")}`;
 }
 
 function printRunResult(result: RuntimeRunResult, opts: GlobalOptions): void {

@@ -135,6 +135,10 @@ test("literature workflow runs with fake connector and creates traceable report"
     assert.equal(prisma.recordsIdentifiedThroughDatabaseSearching, 1);
     assert.equal(prisma.recordsAfterDeduplication, 1);
     assert.equal(prisma.studiesIncludedInSynthesis, 1);
+    const searchEvent = runtime.services.eventBus.events.find((event) => event.type === "literature.search.completed" && event.db === "fake");
+    assert.equal(searchEvent.query.includes("AI agents"), true);
+    assert.equal(searchEvent.count, 1);
+    assert.equal(searchEvent.papers[0].title, "AI agents for scientific discovery");
     const screening = jsonByStage("screening_log");
     assert.equal(screening.decisions.length, 1);
     assert.ok(screening.decisions[0].reason);

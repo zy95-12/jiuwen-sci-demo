@@ -11,7 +11,7 @@ export class ToolRuntime {
     const perm = await this.services.permissionService.check();
     if (!perm.allowed) throw new RuntimeError("TOOL_PERMISSION_DENIED", perm.reason ?? input.toolId);
     const call = await this.services.toolCallStore.create({ sessionId: input.sessionId, toolId: input.toolId, inputJson: input.input, status: "running" });
-    await this.services.eventBus.emit({ type: "tool.started", sessionId: input.sessionId, toolId: input.toolId });
+    await this.services.eventBus.emit({ type: "tool.started", sessionId: input.sessionId, agentId: input.agentId, toolId: input.toolId, input: summarizeForEvent(input.input) });
     try {
       const ctx: ToolContext = {
         runtime: this.services, sessionId: input.sessionId, agentId: input.agentId, toolCallId: call.id,
@@ -21,13 +21,31 @@ export class ToolRuntime {
       };
       const output = await tool.execute(ctx, input.input as never);
       await this.services.toolCallStore.complete(call.id, output);
-      await this.services.eventBus.emit({ type: "tool.completed", sessionId: input.sessionId, toolId: input.toolId });
+      await this.services.eventBus.emit({ type: "tool.completed", sessionId: input.sessionId, agentId: input.agentId, toolId: input.toolId, output: summarizeForEvent(output) });
       return { toolCallId: call.id, output };
     } catch (error) {
       await this.services.toolCallStore.fail(call.id, error instanceof Error ? { message: error.message } : error);
       throw error;
     }
   }
+}
+
+function summarizeForEvent(value: unknown): unknown {
+  if (Array.isArray(value)) return value.length > 5 ? { count: value.length, sample: value.slice(0, 5).map(summarizeForEvent) } : value.map(summarizeForEvent);
+  if (!value || typeof value !== "object") return typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}...` : value;
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (["content", "finalText", "output", "answer", "text"].includes(key) && typeof raw === "string") {
+      out[key] = raw.length > 300 ? `${raw.slice(0, 300)}...` : raw;
+    } else if (Array.isArray(raw)) {
+      out[key] = raw.length > 5 ? { count: raw.length, sample: raw.slice(0, 5).map(summarizeForEvent) } : raw.map(summarizeForEvent);
+    } else if (raw && typeof raw === "object") {
+      out[key] = summarizeForEvent(raw);
+    } else {
+      out[key] = raw;
+    }
+  }
+  return out;
 }
 
 function validateToolInput(tool: ToolDefinition, input: unknown): void {

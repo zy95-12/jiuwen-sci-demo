@@ -51,16 +51,20 @@ export const scienceSearchTool: ToolDefinition<any, any> = {
     if (!connector) {
       const structuredError = sourceError(String(input.db), "search", new SourceRequestError("unsupported", false, `Connector ${String(input.db)} is not registered.`));
       const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db: input.db, query: input.query, error: structuredError }, null, 2) });
+      await ctx.emit({ type: "literature.search.failed", sessionId: ctx.sessionId, agentId: ctx.agentId, db: input.db, query: input.query, error: structuredError.message, errorType: structuredError.errorType, retryable: structuredError.retryable, artifactId: artifact.id });
       return { ...structuredError, query: input.query, count: 0, results: [], artifactId: artifact.id };
     }
+    await ctx.emit({ type: "literature.search.started", sessionId: ctx.sessionId, agentId: ctx.agentId, db, requestedDb: input.db, query: input.query, limit: Number(input.limit ?? 25) });
     try {
       const results = await connector.search({ query: String(input.query), limit: Number(input.limit ?? 25) });
       const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_results", db, query: input.query, requestedDb: input.db, results }, null, 2) });
       await ctx.recordProvenance({ nodes: [{ type: "artifact", refId: artifact.id, label: `Search results from ${db}` }], edges: [] });
+      await ctx.emit({ type: "literature.search.completed", sessionId: ctx.sessionId, agentId: ctx.agentId, db, requestedDb: input.db, query: input.query, count: results.length, artifactId: artifact.id, papers: summarizePapers(results) });
       return { ok: true, db, query: input.query, count: results.length, results, artifactId: artifact.id };
     } catch (error) {
       const structuredError = sourceError(db, "search", error);
       const artifact = await ctx.createArtifact({ type: "json", mediaType: "application/json", content: JSON.stringify({ stage: "search_error", db, query: input.query, requestedDb: input.db, error: structuredError }, null, 2) });
+      await ctx.emit({ type: "literature.search.failed", sessionId: ctx.sessionId, agentId: ctx.agentId, db, requestedDb: input.db, query: input.query, error: structuredError.message, errorType: structuredError.errorType, retryable: structuredError.retryable, artifactId: artifact.id });
       return { ...structuredError, query: input.query, count: 0, results: [], artifactId: artifact.id };
     }
   }
@@ -249,3 +253,15 @@ export const literatureTools = [
   evidenceTableWriteTool,
   citationCheckTool
 ];
+
+function summarizePapers(papers: PaperHit[]): any[] {
+  return papers.slice(0, 5).map((paper) => ({
+    id: paper.id,
+    title: paper.title,
+    year: paper.year,
+    venue: paper.venue,
+    doi: paper.doi,
+    sourceDb: paper.sourceDb,
+    url: paper.url
+  }));
+}
